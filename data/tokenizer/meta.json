@@ -1,0 +1,6 @@
+{
+  "vocab_size": 16384,
+  "pad_id": 0,
+  "pad_token": "<|pad|>",
+  "source": "data/corpus (448 Project Gutenberg books), data/tokenizer/raslila_bpe_gutenberg.json"
+}

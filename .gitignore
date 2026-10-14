@@ -1,0 +1,59 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+env/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Editors / OS
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# --- Data: GENERATED, do not commit -------------------------------
+# Everything under data/ is reproduced by:
+#   python scripts/build_corpus.py        (Gutenberg books)
+#   python scripts/train_tokenizer.py     (BPE)
+#   python scripts/pretokenize_corpus.py  (token cache)
+# Committing it adds ~500MB of files that are one command away.
+data/corpus/
+data/gutenberg/
+data/synthetic/
+data/benchmark/
+data/compare/
+data/foundation/
+data/raw/
+data/*.npy
+data/*.txt
+
+# The tokenizer IS committed: it is a small-ish, non-derivable artifact that
+# fixes the exact tokenization (3.34 chars/token) the reported results assume.
+# Everything else under data/ is derived.
+!data/tokenizer/
+!data/tokenizer/*.json
+
+# --- Checkpoints / training outputs -------------------------------
+checkpoints/
+ck_*/
+runs/
+wandb/
+logs/
+*.pt
+*.pth
+*.ckpt
+*.safetensors
+*.csv
+!docs/**/*.csv
+
+# Experiment outputs from the benchmarks
+*.log
+
+# OS
+.DS_Store
+Thumbs.db

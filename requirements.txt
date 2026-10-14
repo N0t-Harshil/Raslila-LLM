@@ -1,0 +1,46 @@
+# Core dependencies
+numpy>=1.24
+scipy>=1.10
+matplotlib>=3.8  # architecture diagram only
+
+# Deep learning (REQUIRED for the Raslila model - raslila.py)
+torch>=2.0
+
+# Config loading
+pyyaml>=6.0
+
+# Data loading / tokenization
+# tokenizers is REQUIRED for BPE mode (the default): scripts/train_tokenizer.py
+# and the cached token corpus both use it. Verified with 0.22.2.
+tokenizers>=0.13
+# datasets is REQUIRED: it is how the training corpus arrives. Training pulls
+# openwebtext from the HuggingFace Hub on first run (src/raslila/hf_dataset.py);
+# without this package the trainer exits with install instructions. Verified
+# with 4.0.0.
+datasets>=2.14
+huggingface_hub>=0.20
+
+# Optional: Quantum backend (hybrid / hardware scaling)
+# pennylane>=0.33
+# pennylane-lightning>=0.33
+
+# Optional: Experiment tracking
+# wandb>=0.15
+
+# ---------------------------------------------------------------------------
+# DATA IS NOT IN THIS REPOSITORY
+# ---------------------------------------------------------------------------
+# The corpus, the token cache and the checkpoints are all gitignored (~550MB
+# total). Everything is reproduced by these three commands, in order:
+#
+#   pip install -r requirements.txt
+#   python scripts/build_corpus.py         # -> data/corpus/*.txt   (Gutenberg)
+#   python scripts/train_tokenizer.py      # -> data/tokenizer/     (BPE-16k)
+#   python scripts/pretokenize_corpus.py   # -> data/corpus_tokens.npy
+#
+# The tokenizer IS committed (data/tokenizer/), because it fixes the exact
+# tokenization the published numbers assume and cannot be reproduced bit-exactly.
+#
+# Current run: see docs/08_Runbook_Bidirectional_Test.md. Quick smoke test:
+#   python scripts/train_raslila.py --steps 3 --batch-size 1 --seq-len 32 --out-dir ck_smoke
+# ---------------------------------------------------------------------------

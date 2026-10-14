@@ -1,0 +1,215 @@
+# Raslila 20B — FSDP groundwork, 4x A100-80GB
+# ===========================================
+# 17,820,462,270 params: 5 sheets x (5x5) = 125 regions, node_depth 11,
+# brain-like wiring (diagonal + boosted long-range, 1114 edges).
+#
+# THIS CONFIG WILL NOT FIT WITH DDP. It is built for FSDP (--fsdp).
+# Read the memory arithmetic before you launch:
+#
+#   17.820B params x 16 bytes (bf16 params+grads, fp32 master + 2 Adam moments)
+#        = 285.1 GB of training state
+#   4 GPUs x 80 GB = 320 GB
+#        -> 34.9 GB total headroom before activations.
+#
+# FSDP FULL_SHARD splits that state evenly: 285.1 / 4 = 71.28 GB per rank,
+# leaving about 8.7 GB per rank for activations and runtime overhead.
+# `activation_checkpoint: true` remains enabled to reduce stored activations.
+#
+# IF YOU OOM, do these in order (each is a real lever, not a guess).
+# Numbers are measured on this exact config (meta-device count, zero alloc):
+#   1. node_depth 11 is the shipped, fitting shape: 17,820,462,270 params,
+#      285.1 GB total, 71.28 GB/rank, about 8.7 GB/rank headroom.
+#   2. fsdp_cpu_offload: true moves optimizer state to host RAM if needed.
+#   3. mixed_precision: bf16 keeps master weights fp32 for stability but stores
+#      params+grads in bf16. Already on.
+#
+# NOTE on the brain-like wiring: diagonal+long-range adds 146,831,872 params
+# The shipped 11-depth shape retains the 1,114-edge wiring.
+#
+# TOKEN BUDGET — resolved by the new corpus.
+#   Training now pulls openwebtext from HuggingFace at start-up (see the
+#   `dataset:` section) and caches up to `dataset.max_tokens` = 1.5B tokens.
+#   Chinchilla-optimal for 20.77B is ~415M, so 1.5B is 3.6x OVER, not short.
+#   The old Gutenberg corpus (85,151,573 tokens) was 4.7x UNDER, which is
+#   what made 20B indefensible before. It is the corpus that changed, not the
+#   arithmetic.
+#
+# LAUNCH (from the remote box; the corpus downloads itself on first run):
+#   torchrun --standalone --nproc_per_node=4 scripts/train_raslila.py \
+#       --config config_20b.yaml --fsdp --steps 30000
+#
+#   --fsdp is REQUIRED. Without it this falls back to DDP and OOMs on step 0.
+#   Verify first with a 20-step smoke run, not 30000. Watch tok/s and peak
+#   memory (nvidia-smi) before committing to days of training.
+
+model:
+  n_qubits: 20
+  n_universes: 4
+  n_layers: 4
+  interference_qubits: [0, 2]
+  readout_qubits: [0, 2, 4]
+
+raslila:
+  layout: deep_grid
+
+  # 125 regions, node_depth 11 -> 17.82B. See header for the arithmetic.
+  depth_layers: 5
+  grid_h: 5
+  grid_w: 5
+
+  num_layers: 1
+  node_depth: 11          # 11 transformer blocks stacked per region
+  hidden_dim: 1024        # multiple of 128; 8 heads -> head_dim 128 (even, RoPE)
+  num_heads: 8
+  ff_dim: 4096
+  dropout: 0.1
+
+  use_rope: true
+  rope_theta: 10000.0
+  use_swiglu: true
+  use_rmsnorm: true
+  qk_norm: true
+  tie_weights: true
+  lns: false
+  gated_messages: false
+
+  # MANDATORY at this scale. See header: without it the stored activations
+  # (125 regions x 11 blocks) dominate memory and you OOM long before the
+  # weights are the problem. Verified bit-identical (fwd and grad) to the
+  # non-checkpointed path when dropout=0.
+  activation_checkpoint: true
+
+  mtp_steps: 0
+  mtp_weight: 0.3
+  workspace_slots: 0
+  readout_topk: 0
+
+  bind_roles: 4
+  bind_local: false
+
+  replay_prob: 0.0
+  replay_weight: 1.5
+
+  # Growth is disabled: FSDP cannot insert new parameters into an already
+  # wrapped module. The trainer also refuses this path under --fsdp.
+  grow_every: 0
+  grow_min_scale: 0.004
+  grow_step: 2
+  grow_max_nodes: 64
+
+  immediate_updates: true
+  priority_order: false
+  settle_thresh: 0.0
+
+  depth_sweeps: 2
+
+  inhibit: false
+  inhibit_neg: true
+  inhibit_beta: 1.0
+
+  state_dim: 0
+  state_decay_init: 0.9
+
+  local_radius: 1
+  long_range_prob: 0.3   # brain-like small-world: dense local + sparse long-range
+  max_long_range: 8
+  connectivity_seed: 42
+  lateral: true
+  vertical: true
+  diagonal: true         # 4-neighbour -> 8-neighbour. 618 -> 1114 edges,
+                         # +146,831,872 params at this hidden_dim.
+  feedback: true
+  readout_layer: last
+
+  edge_hidden_dim: 96
+  edge_layers: 2
+
+  vocab_size: 16384     # must match dataset.tokenizer's vocab size
+  causal: true
+
+hamiltonian:
+  normalization_method: "spectral"
+  krylov_dim: 32
+  spectral_norm: true
+  interference_qubits: [0, 2]
+  alpha_init: 0.5
+  beta_init: 0.5
+
+mlp:
+  hidden_dim: 4096
+  activation: "squash_sin"
+  num_layers: 2
+  dropout: 0.1
+
+embeddings:
+  vocab_size: 32000
+  embed_dim: 64
+  pos_embedding: true
+
+readout:
+  n_qubits: 3
+  qubit_indices: [0, 2, 4]
+  tokens: ["grief", "logic", "memory", "clarity", "longing", "reason", "dream", "empathy"]
+
+memory:
+  enabled: true
+  max_snapshots: 1000
+  resonance_threshold: 0.1
+
+# Corpus: HuggingFace openwebtext, fetched and tokenized on first run.
+# Rank 0 does the download; the other ranks wait and then load the cache.
+# The old 85,151,573-token Gutenberg corpus is retired -- it was 4.7x short of
+# Chinchilla-optimal for the 20B config and only 1.7 epochs for the 50M one.
+# Legacy fallback: set training.data_dir to a dir of .txt files and remove
+# this section entirely.
+dataset:
+  name: "Skylion007/openwebtext"   # ~9.5B tokens of modern web text
+  split: "train"
+  text_field: "text"
+  max_tokens: 1500000000           # 1.5B tokens; uint32 cache = 6.0 GB
+  cache: "data/openwebtext_tokens.npy"
+  tokenizer: "data/tokenizer/raslila_bpe.json"
+  vocab_size: 16384                # must equal raslila.vocab_size
+  train_tokenizer: true            # re-fit BPE on openwebtext, then reuse it
+  tokenizer_sample_chars: 300000000
+  val_tokens: 0                 # optional stable validation prefix; 0 disables
+
+training:
+  # batch 8 x seq 256 = 2048 tokens/rank. Small batch because at 20B the
+  # activation footprint per sequence is the scarce resource, not the weights.
+  # Raise batch_size before raising seq_len: attention is O(T^2) per region and
+  # there are 125 regions x 11 blocks x 2 sweeps of it.
+  batch_size: 8
+  seq_len: 256
+  tok_mode: bpe
+  out_dir: checkpoints/raslila_20b
+  save_every: 1000
+  learning_rate: 1.0e-3   # retuned for the larger batch/token count; 6e-4 was for 32x128
+  weight_decay: 0.1
+  warmup_steps: 500
+  max_steps: 30000
+  grad_clip: 1.0
+  mixed_precision: "bf16"  # required. fp32 would double the sharded state to 657 GB.
+  gradient_accumulation: 1
+  eval_every: 500
+
+  # Constant LR. See config_50m.yaml for why the plateau schedule is disabled.
+  adaptive_lr: false
+  lr_factor: 0.5
+  lr_patience: 500
+  lr_threshold: 0.001
+  min_lr: 1.0e-5
+distributed:
+  backend: "nccl"
+  fsdp: true               # informational; --fsdp on the CLI is what activates it
+  fsdp_sharding: "full"    # FULL_SHARD
+  fsdp_cpu_offload: false  # set true only if you OOM; costs ~1.5-2x step time
+  ddp_bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+
+output:
+  dir: "checkpoints/raslila_20b"
+  save_every: 1000
+  keep_last_n: 3
+  wandb_project: "raslila-20b"
+  wandb_entity: null

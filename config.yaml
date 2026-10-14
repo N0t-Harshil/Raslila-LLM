@@ -1,0 +1,304 @@
+# Raslila Model Configuration
+# =============================
+# Scale up/down by changing these values
+#
+# ACTIVE EXPERIMENT: testing exactly ONE variable.
+#   config.yaml                      -> depth_sweeps: 2  (bidirectional)
+#   config_baseline_feedforward.yaml -> depth_sweeps: 1  (feedforward)
+#   Those two files differ by that single key and nothing else. Both build to
+#   163,605,123 parameters with the same 618-edge graph (connectivity_seed
+#   keeps the wiring identical), so any loss difference is attributable to the
+#   traversal direction and to nothing else.
+#   Do not edit config_baseline_feedforward.yaml by hand -- regenerate it from
+#   this file so the two stay matched.
+#
+#   Inhibition, persistent state and replay are implemented and structurally
+#   verified, and all OFF. None is proven on loss, and enabling several at once
+#   makes a result unattributable. They are activated one at a time, each kept
+#   only if it beats the winner of the previous round.
+#   See docs/08_Runbook_Bidirectional_Test.md.
+#
+# NOTE: The active Raslila model (raslila.py) is classical. The quantum
+# configuration below is retained for the quantum research subsystem
+# (model.py / gpu_hamiltonian.py) and historical reference.
+
+model:
+  # Quantum architecture (research subsystem only)
+  n_qubits: 20           # Total qubits (n_layers * n_universes)
+  n_universes: 4         # Number of universes (horizontal lenses)
+  n_layers: 4            # Number of layers (vertical abstraction)
+  
+  # Interference qubits (for XX+YY entanglement)
+  interference_qubits: [0, 2]  # Qubit indices for XX+YY coupling
+  
+  # Readout qubits for token prediction (3 qubits = 8 tokens)
+  readout_qubits: [0, 2, 4]
+
+# Raslila architecture (ACTIVE - raslila.py)
+raslila:
+  layout: deep_grid      # deep_grid = 2D grid per layer, layers stacked (cortex-like)
+                         # flat3d    = legacy single flat 3D lattice
+
+  # Deep-grid layout: a conventional LLM is the degenerate 1D case, one flat
+  # chain of blocks. Raslila restores a 2D sheet per layer and stacks sheets.
+  depth_layers: 5        # sequential layers (cortical sheets)
+  grid_h: 5              # rows per layer
+  grid_w: 5              # blocks per row
+                         # -> 5 x (5x5) = 125 blocks, like:
+                         #      layer 3  [ ][ ][ ][ ][ ]
+                         #               [ ][ ][ ][ ][ ]   2D sheet, blocks
+                         #               [ ][ ][ ][ ][ ]   connected laterally
+                         #                  ||
+                         #      layer 2  [ ][ ][ ][ ][ ]   vertically connected
+                         #               [ ][ ][ ][ ][ ]
+                         #                  ||
+                         #      layer 1  [ ][ ][ ][ ][ ]
+                         # Each layer owns DISTINCT weights (a real deep net,
+                         # not a recurrent loop), and the readout uses the last.
+
+  num_layers: 1          # extra cascade rounds INSIDE each layer (multidirectional
+                         # cascades between its blocks; weights reused)
+  node_depth: 1          # transformer blocks stacked inside one block
+                         # node_depth dominates param count; edge params scale
+                         # with block count. Measured (vocab 16384, hidden 256):
+                         #   5 layers x 5x5 d1 = 260M | d2 = 357M | d3 = 455M
+  hidden_dim: 256        # block hidden width (attention/FFN inner)
+  num_heads: 8
+  ff_dim: 1024           # FFN width; SwiGLU auto-scales its inner to ~2/3
+  dropout: 0.1
+  # Modern block recipe (2023-2026 consensus)
+  use_rope: true        # rotary positions (replaces learned absolute table)
+  rope_theta: 10000.0
+  use_swiglu: true      # gated SiLU FFN (replaces plain GELU MLP)
+  use_rmsnorm: true     # RMSNorm + pre-norm (replaces post-norm LayerNorm)
+  qk_norm: true         # per-head Q/K RMSNorm (stability)
+  tie_weights: true     # share token embedding with output head
+  lns: false            # LayerNorm Scaling (A/B: no gain at our depth)
+  gated_messages: false # neuromodulation gate on edge traffic (A/B: no gain)
+  # Brain mechanisms (neuroscience-grounded; enable after A/B validation)
+  mtp_steps: 0          # extra future-byte heads t+2.. (hierarchical prediction)
+  mtp_weight: 0.3       # MTP auxiliary loss weight
+  workspace_slots: 0    # global-workspace bottleneck slots (0 = off)
+  readout_topk: 0       # k-winners-take-all regions at readout (0 = dense)
+  # Binding / conceptual blending (3D grid = the separated region substrate)
+  bind_roles: 4         # K learned roles; regions bound multiplicatively (TPR-style)
+  bind_local: false     # also bind regions with their 3D grid neighbours (no gain)
+  # Learning from experience (replay). IMPLEMENTED BUT OFF.
+  # Humans revisit what they have seen (sleep replay re-runs the day's episodes
+  # at 10-20x), and we otherwise see each passage once, which is the recipe for
+  # catastrophic forgetting. Left OFF for the baseline run so the one variable
+  # under test is the bidirectional sweep. Turn on ONE mechanism at a time.
+  replay_prob: 0.0      # fraction of steps from ALREADY-SEEN text (0=off)
+  replay_weight: 1.5    # replayed batches count more than fresh ones
+
+  # Cortical growth: start small, add regions on plateaus (dense, not routed)
+  grow_every: 0         # check every N steps (0 = fixed-size model)
+  grow_min_scale: 0.004 # grow when relative improvement < this (plateau)
+  grow_step: 2          # regions added per growth event
+  grow_max_nodes: 64    # ceiling on total regions
+  # Multidirectional recurrence (brain-like back-and-forth; A/B validated)
+  immediate_updates: true   # Gauss-Seidel cascades (A/B: -0.026 nats, free)
+  priority_order: false     # visit most-surprised nodes first (A/B: no gain)
+  settle_thresh: 0.0        # >0: halt rounds when traffic < thresh (untested)
+  # ==========================================================================
+  # THE ONE VARIABLE UNDER TEST
+  # ==========================================================================
+  # Bidirectional depth sweeps. The cortex is not a feedforward stack: a
+  # hypothesis travels up the sheets and comes back DOWN, refining it.
+  #
+  # With depth_sweeps=1 the feedback edges EXIST in the graph but are never
+  # actually used -- a lower sheet is written before the sheet above it has
+  # anything to send back. So "the connections were bidirectional" was never
+  # true in the executed model; it was only true on paper. Each extra sweep
+  # alternates direction, which is what finally makes the flow bidirectional.
+  #
+  # Direction order matters: the last sweep ends at the deepest layer, because
+  # that is the layer the readout reads. Ending on a downward pass would discard
+  # the refinement.
+  #
+  # Cost: ~2x compute, ZERO extra parameters (the weights are reused).
+  # Verified structurally: 2 sweeps change the output representation ~19% vs 1
+  # sweep. NOT yet verified on loss -- a 200-step / 6-seed A/B showed no
+  # significant difference (-0.007 +/- 0.009 nats), and 200 steps on a 165M
+  # model is too short to measure anything. This run exists to answer it.
+  depth_sweeps: 2        # 1 = feedforward only | 2 = down+up | 3+ = more refine
+
+  # Lateral inhibition. IMPLEMENTED BUT OFF.
+  # ~20% of cortical neurons are inhibitory interneurons, and that competition
+  # is what makes a representation selective; every edge message here is
+  # additive, so blocks cannot argue against a competitor.
+  # 3-seed A/B said winner (-0.005 nats); the 6-seed re-run did NOT confirm it
+  # (+0.001 +/- 0.009). Unverified. Off for the baseline; candidate #2.
+  inhibit: false         # signed excitatory/inhibitory message per edge
+  inhibit_neg: true      # the inhibitory half actually subtracts
+  inhibit_beta: 1.0      # weight on inhibition
+
+  # Persistent state across token positions. IMPLEMENTED BUT OFF.
+  # Gated linear recurrence (h_t = a*h_{t-1} + (1-a)*x_t) with a learned
+  # per-channel decay, so slow channels carry topic and fast channels syntax.
+  # Inference-only like a KV cache: cleared between sequences, never
+  # checkpointed. Structurally verified; no significant 6-seed loss change.
+  # Costs +1.3M params on 165M. Off for the baseline; candidate #3.
+  state_dim: 0           # per-block recurrent width (0 = off)
+  state_decay_init: 0.9  # initial per-channel retention
+
+  # Connectivity (deep grid)
+  local_radius: 1       # legacy flat3d only
+  long_range_prob: 0.1  # small-world: 10% of blocks reach past the local
+                        # neighbourhood. Cortex is small-world: dense local
+                        # columns plus sparse long-range white-matter tracts.
+  max_long_range: 3
+  # Seeds the WIRING ONLY (which blocks get shortcut edges), not the weights.
+  # This exists because the code used to call random.seed(42) on the GLOBAL RNG
+  # while building the graph, so every model construction silently rewound the
+  # caller's randomness and training-time sampling became order-dependent.
+  connectivity_seed: 42 # keep fixed for A/B comparability: same graph, both arms
+  lateral: true         # blocks connect left/right/up/down inside a layer
+  vertical: true        # a block connects to the same cell in layer L+/-1
+  # NOTE: diagonals and heavier long-range wiring were trialled (long_range_prob
+  # 0.3, max_long_range 8, diagonal true). They are OFF
+  # for the current experiment because changing the graph would break the
+  # single-variable A/B against config_baseline_feedforward.yaml, which is
+  # generated from this file and must differ by depth_sweeps alone. Revisit as
+  # their own experiment AFTER the bidirectional result is settled.
+  diagonal: false       # true = 4-neighbour -> 8-neighbour in-layer
+  feedback: true        # allow L+1 -> L as well. The cortex is not feedforward;
+                        # feedback is what makes this a brain-like recurrent
+                        # system rather than a plain deep stack.
+  readout_layer: last   # 'last' = only the deepest layer feeds the readout
+                         # 'all'  = every block does
+  edge_hidden_dim: 128  # edge network INTERNAL width; edge params scale with
+                         # block count (618 edges = 61M of the 164M total).
+                         # trim to 64 (~31M edges, 133M) or 32 (~15M, 118M)
+  edge_layers: 2
+  vocab_size: 16384      # BPE tokens (id 0 = <|pad|>). MUST match the data:
+                         # data/corpus_tokens.npy max id is 16383. Setting 257
+                         # with the BPE corpus trains on garbage silently.
+  max_seq_len: 1024      # used only when use_rope is false (no absolute table)
+  causal: true          # position t sees only positions <= t. NEVER set false
+                        # for next-token training: it lets a position read the
+                        # answer, and the loss then means nothing.
+
+# Hamiltonian settings
+hamiltonian:
+  normalization_method: "spectral"  # "spectral", "frobenius", "fixed_driver", "none"
+  krylov_dim: 32          # Krylov subspace dimension for evolution
+  spectral_norm: true     # Normalize Hamiltonian by spectral norm
+  interference_qubits: [0, 2]  # Qubits for XX+YY interference
+  
+  # Interference parameters (learned)
+  alpha_init: 0.5         # Initial XX coupling strength
+  beta_init: 0.5          # Initial YY coupling strength
+
+# MLP for edge couplings (J_ij)
+mlp:
+  hidden_dim: 4096        # Hidden dimension (controls model capacity)
+  activation: "squash_sin"  # "squash_sin", "tanh", "gelu"
+  num_layers: 2           # Number of hidden layers
+  dropout: 0.1
+
+# Token embeddings
+embeddings:
+  vocab_size: 32000
+  embed_dim: 64           # Token embedding dimension
+  pos_embedding: true
+
+# Readout
+readout:
+  n_qubits: 3             # Number of readout qubits (3 = 8 tokens)
+  qubit_indices: [0, 2, 4]  # Which qubits to read out
+  tokens: ["grief", "logic", "memory", "clarity", "longing", "reason", "dream", "empathy"]
+
+# Memory
+memory:
+  enabled: true
+  max_snapshots: 1000
+  resonance_threshold: 0.1
+
+# Training (train_raslila.py reads ALL of these; CLI flags override per-run)
+# Memory guide for this 260M model. AdamW state is ~16 bytes/param = 4.2 GB
+# and that floor is fixed regardless of batch; batch/seq drive activations:
+#   batch 8  x seq 128  ->  ~7 GB    (fits a 16 GB card)
+#   batch 16 x seq 256  -> ~17 GB    (A100 40GB+, or Colab Pro 16GB+)
+#   batch 32 x seq 512  -> ~58 GB    (multi-GPU only)
+# If you hit OOM, lower batch_size first, or keep the batch and raise
+# gradient_accumulation (same effective batch, less memory).
+# Corpus: the ACTIVE training corpus is the Gutenberg set under
+# training.data_dir (see below), which produces data/corpus_tokens.npy.
+#
+# NOTE: the `dataset:` block below is NOT read by train_raslila.py. It configures
+# scripts/get_dataset.py, which pulls a HuggingFace corpus into its own cache.
+# That path has never been used for the active configuration, and no
+# openwebtext cache exists on this machine -- the earlier claim that it had been
+# "fetched and tokenized on first run" was false. Leave this block alone unless
+# you intend to switch corpora deliberately, and regenerate
+# config_baseline_feedforward.yaml afterwards so the A/B stays single-variable.
+dataset:
+  name: "Skylion007/openwebtext"   # unused by the active config
+  split: "train"
+  text_field: "text"
+  max_tokens: 1500000000           # 1.5B tokens; uint32 cache = 6.0 GB
+  cache: "data/openwebtext_tokens.npy"
+  tokenizer: "data/tokenizer/raslila_bpe.json"
+  vocab_size: 16384                # must equal raslila.vocab_size
+  train_tokenizer: true            # re-fit BPE on openwebtext, then reuse it
+  tokenizer_sample_chars: 300000000
+  val_tokens: 0                 # optional stable validation prefix; 0 disables
+
+training:
+  batch_size: 8
+  seq_len: 128             # context window; CLI --seq-len overrides
+  tok_mode: bpe            # bpe (3.34 chars/token, default) | bytes
+  # REQUIRED by train_raslila.py: the corpus directory and the BPE tokenizer.
+  # Without these the trainer has no data and falls back to random token ids.
+  data_dir: data/corpus   # 448 real PG books, ~299 MB -> data/corpus_tokens.npy
+  tokenizer: data/tokenizer/raslila_bpe.json
+  out_dir: checkpoints/raslila  # CLI --out-dir overrides
+  save_every: 1000         # checkpoint interval; CLI --save-every overrides
+  learning_rate: 3e-4
+  weight_decay: 0.1
+  warmup_steps: 500
+  max_steps: 20000       # default target; the runbook passes --steps 20000
+  grad_clip: 1.0
+  mixed_precision: "bf16"  # A100 default; Colab T4 MUST pass --mixed-precision fp16
+  # Effective batch = batch_size * gradient_accumulation = 8 * 8 = 64.
+  # There was ALSO an `accumulation_steps: 8` key here, a duplicate that the
+  # loader silently ignored in favour of this one. Only this key is read.
+  gradient_accumulation: 8
+  eval_every: 500
+
+  # Loss-adaptive learning rate (train_raslila.py)
+  adaptive_lr: true        # decay LR when loss plateaus
+  lr_factor: 0.5           # multiply LR by this on plateau
+  lr_patience: 500         # steps of no improvement before decay
+  lr_threshold: 0.001      # relative min improvement to reset patience
+
+  # LR schedule (legacy quantum trainers use this)
+  min_lr: 1e-5
+
+# Data
+# NOT USED by train_raslila.py -- it reads training.data_dir (above) instead.
+# This block is legacy from the HuggingFace-era trainers. TinyStories was never
+# the active dataset; the model has always trained on Project Gutenberg text.
+# Left in place only so those legacy scripts do not break on a missing key.
+data:
+  dataset: "roneneldan/TinyStories"   # legacy; not read by train_raslila.py
+  train_split: "train[:10000]"        # legacy
+  val_split: "train[10000:11000]"     # legacy
+  train_batch_size: 8
+  val_batch_size: 8
+  num_workers: 4
+
+# Distributed
+distributed:
+  backend: "nccl"    # "nccl" for 4xH100 server; "gloo" for Colab (no NCCL in default torch)
+  ddp_bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+
+# Output
+output:
+  dir: "checkpoints/raslila_2m"
+  save_every: 1000
+  keep_last_n: 3
+  wandb_project: "raslila-2m"
+  wandb_entity: null

@@ -1,0 +1,225 @@
+# Raslila 50M — production topology, TPU-sized
+# ===========================================
+# 92,589,790 params: 5 sheets x (5x5) = 125 blocks, 1114 edges.
+#
+# BRAIN-LIKE WIRING (2026-10). `diagonal: true` + `long_range_prob: 0.3` +
+# `max_long_range: 8` replace the original `false/0.1/3`. Measured cost of the
+# change, same shape, same seed:
+#
+#     wiring                          params        edges  fwd (CPU, batch 8)
+#     original  (4-neighbour, 0.1/3)  74,194,142      618   1378 ms
+#     brain-like (8-neighbour, 0.3/8) 92,589,790     1114   1854 ms
+#
+# +1.25x params, +1.80x edges, +34% forward time. (Forward times were
+# measured at the old 16,384-token vocab; the wiring delta is what matters.)
+# This invalidates every prior
+# checkpoint for this config: the edge key set changed, so an old .pt cannot
+# load. Fresh run.
+#
+# WHY THIS SHAPE
+#   This is config.yaml's PRODUCTION topology with narrower blocks -- same
+#   125 blocks, same connectivity_seed, hidden_dim 256->128 and
+#   edge_hidden_dim 128->96. Measured at the ORIGINAL wiring:
+#
+#     shape            params        blocks  edges  E/N   full-6-connected
+#     5x(5x5) h128      74,194,142     125    618  4.94   36/125 (29%)
+#     5x(4x4) h160      72,088,126      80    383  4.79   21/80  (26%)
+#     6x(4x4) h160      80,259,262      96    465  4.84   23/96  (24%)
+#     4x(5x5) h192     101,307,614     100    487  4.87   22/100 (22%)
+#     5x(5x5) h256     164,785,406     125    618  4.94   36/125 (29%)
+#
+#   The 5x5 sheet wins on every connectivity measure AND is the shape the
+#   project's earlier work and ablations were actually run on, so results here
+#   are comparable to the existing 260M baseline rather than a new topology.
+#   That matters: at equal parameters the grid shape is a confound (see the
+#   E/N column), and the fewer full 6-neighbourhood blocks a grid has, the more
+#   of it is boundary doing less of the thing the architecture is for.
+#
+#   hidden_dim 128 is also a multiple of 128, which is what the TPU matrix
+#   units want -- 192 and 160 would pad poorly.
+#
+# TPU
+#   Run with scripts/train_raslila_tpu.py, NOT train_raslila.py:
+#     !pip install -q "torch_xla[tpu]"
+#     !python scripts/train_raslila_tpu.py --config config_50m.yaml --steps 30000
+#
+#   CHECK THROUGHPUT BEFORE COMMITTING TO 30k STEPS. The forward pass runs a
+#   Python loop over all 1114 edges, and it calls `.tolist()` once per block per
+#   sweep to enumerate incoming neighbours (raslila.py). That is 125 x
+#   depth_sweeps = 250 host-device syncs per forward on a 125-block model, plus
+#   1114 small op launches. XLA graphs hate exactly this pattern. Measure
+#   tok/s for 100 steps first; if it is far below what the GPU trainer achieves,
+#   the fix is to precompute the edge index list once as a Python list at
+#   __init__ (it is static per config) instead of calling torch.where().tolist()
+#   inside the hot loop. That is a contained change and likely a large win.
+#
+#   Disk: checkpoints are model-state only (the TPU trainer does not save
+#   optimizer state), ~200 MB each, so 30 checkpoints over 30k steps is ~6 GB.
+#   Fine against the 225 GB disk.
+
+model:
+  n_qubits: 20
+  n_universes: 4
+  n_layers: 4
+  interference_qubits: [0, 2]
+  readout_qubits: [0, 2, 4]
+
+raslila:
+  layout: deep_grid
+
+  # Production topology from config.yaml, narrowed to reach 50M.
+  depth_layers: 5
+  grid_h: 5
+  grid_w: 5              # -> 125 blocks, 1114 edges
+
+  num_layers: 1
+  node_depth: 1
+  hidden_dim: 128        # multiple of 128 for TPU matrix units
+  num_heads: 8           # head_dim 16, even (RoPE requirement)
+  ff_dim: 512
+  dropout: 0.1           # tokens are NOT scarce on a TPU, so keep regularising
+
+  use_rope: true
+  rope_theta: 10000.0
+  use_swiglu: true
+  use_rmsnorm: true
+  qk_norm: true
+  tie_weights: true
+  lns: false
+  gated_messages: false
+
+  mtp_steps: 0
+  mtp_weight: 0.3
+  workspace_slots: 0
+  readout_topk: 0
+
+  bind_roles: 4          # largest single measured gain; 125 streams available
+  bind_local: false
+
+  replay_prob: 0.0
+  replay_weight: 1.5
+
+  grow_every: 0
+  grow_min_scale: 0.004
+  grow_step: 2
+  grow_max_nodes: 64
+
+  immediate_updates: true    # measured -0.026 nats, free
+  priority_order: false
+  settle_thresh: 0.0
+
+  depth_sweeps: 2        # bidirectional. Verified: perturbing the deepest
+                         # layer changes layer 0 by 2.1e+01, i.e. the feedback
+                         # edges genuinely carry information downward.
+
+  inhibit: false         # no measured gain; off
+  inhibit_neg: true
+  inhibit_beta: 1.0
+
+  state_dim: 0           # no measured gain; off
+  state_decay_init: 0.9
+
+  local_radius: 1
+  long_range_prob: 0.3  # small-world: 30% of blocks reach past the local
+                        # neighbourhood (cortex: dense columns + sparse tracts)
+  max_long_range: 8
+  connectivity_seed: 42    # same wiring as config.yaml's 260M model
+  lateral: true
+  vertical: true
+  diagonal: true        # in-layer diagonals: 4-neighbour -> 8-neighbour.
+                        # Brain-like wiring: 618 -> 1114 edges.
+  feedback: true
+  readout_layer: last
+
+  edge_hidden_dim: 96
+  edge_layers: 2
+
+  vocab_size: 16384     # must match the tokenizer vocab (raslila_bpe.json)
+                        # and the token cache's max id
+  causal: true          # NEVER false for next-token training
+
+hamiltonian:
+  normalization_method: "spectral"
+  krylov_dim: 32
+  spectral_norm: true
+  interference_qubits: [0, 2]
+  alpha_init: 0.5
+  beta_init: 0.5
+
+mlp:
+  hidden_dim: 4096
+  activation: "squash_sin"
+  num_layers: 2
+  dropout: 0.1
+
+embeddings:
+  vocab_size: 32000
+  embed_dim: 64
+  pos_embedding: true
+
+readout:
+  n_qubits: 3
+  qubit_indices: [0, 2, 4]
+  tokens: ["grief", "logic", "memory", "clarity", "longing", "reason", "dream", "empathy"]
+
+memory:
+  enabled: true
+  max_snapshots: 1000
+  resonance_threshold: 0.1
+
+# Corpus: HuggingFace openwebtext, fetched and tokenized on first run.
+# Rank 0 does the download; the other ranks wait and then load the cache.
+# The old 85,151,573-token Gutenberg corpus is retired -- at 30k steps x 4096
+# tok/step this run alone consumes 122.9M tokens, i.e. 1.4 epochs of it.
+dataset:
+  name: "Skylion007/openwebtext"   # ~9.5B tokens of modern web text
+  split: "train"
+  text_field: "text"
+  max_tokens: 1500000000           # 1.5B tokens (20x a 50M model, Chinchilla)
+  cache: "data/openwebtext_tokens.npy"   # 6.0 GB, uint32
+  tokenizer: "data/tokenizer/raslila_bpe.json"
+  vocab_size: 16384                # must equal raslila.vocab_size
+  train_tokenizer: true            # re-fit BPE on openwebtext, then reuse it
+  tokenizer_sample_chars: 300000000
+  val_tokens: 0                 # optional stable validation prefix; 0 disables
+
+training:
+  # TPU prefers a large batch to keep the matrix units fed: 32 x 128 = 4096
+  # tokens per optimizer step. Lower batch_size first if you hit OOM; raise
+  # gradient_accumulation for the same effective batch with less memory.
+  batch_size: 32
+  seq_len: 128
+  tok_mode: bpe
+  out_dir: checkpoints/raslila_50m
+  save_every: 1000
+  learning_rate: 6.0e-4
+  weight_decay: 0.1
+  warmup_steps: 200
+  max_steps: 30000
+  grad_clip: 1.0
+  mixed_precision: "no"   # the TPU trainer does not read this key; see below
+  gradient_accumulation: 1
+  eval_every: 500
+
+  # Constant LR. The plateau schedule is what crippled the 15M run: it walked
+  # the LR to the 1e-5 floor by step ~3250 and spent the next 5.1M tokens
+  # (5750 steps) for only 0.059 nats, versus 0.35 nats for the 3.3M tokens
+  # before it. ~10x less token-efficient. Do not turn this on.
+  adaptive_lr: false
+  lr_factor: 0.5
+  lr_patience: 500
+  lr_threshold: 0.001
+  min_lr: 1.0e-5
+  min_lr: 1.0e-5
+
+distributed:
+  backend: "nccl"      # 4x A100. Was "gloo", the Colab-without-CUDA fallback.
+  ddp_bucket_cap_mb: 25
+  gradient_as_bucket_view: true
+
+output:
+  dir: "checkpoints/raslila_50m"
+  save_every: 1000
+  keep_last_n: 3
+  wandb_project: "raslila-50m"
+  wandb_entity: null
