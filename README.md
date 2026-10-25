@@ -179,6 +179,26 @@ Measured sizes (BPE vocab 16,384):
 
 ## Quickstart
 
+**Easiest: `run.py` does everything.** `python run.py` lists the commands.
+
+```bash
+python run.py setup                                   # install, show GPU
+python run.py check                                   # validate configs
+python run.py data                                    # FineWeb-Edu, once (~3 GB)
+python run.py smoke                                   # 3-step sanity run
+python run.py ab                                      # depth_sweeps A/B (1 GPU per arm)
+python run.py compare                                 # A/B verdict
+python run.py train --config config_adaptive.yaml     # adaptive-depth model
+python run.py eval  --config config_adaptive.yaml     # loss, speed, thinking cycles
+python run.py live                                    # always-on chat session
+python run.py train --config config.yaml --resume latest   # continue an interrupted run
+python run.py all                                     # the whole pipeline in order
+```
+
+Every command logs to `logs/<command>_<time>.log`. Over SSH, run long jobs in
+`tmux`/`screen`. The scripts below are what `run.py` calls, for finer control.
+
+
 ```powershell
 pip install -r requirements.txt
 
