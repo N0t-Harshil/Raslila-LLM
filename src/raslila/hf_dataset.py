@@ -8,11 +8,25 @@ project, not the architecture: it is 4.7x short of Chinchilla-optimal for the 20
 config, and even for the 50M config it was 2.7 epochs over a 30k-step run with
 the loss flat by step 14k.  openwebtext is ~9.5B tokens of modern web text.
 
+DATA QUALITY (2026-10).  The default corpus is now FineWeb-Edu (sample-10BT):
+web text filtered by an educational-quality classifier and deduplicated, which
+the FineWeb paper (arXiv 2406.17557) measured well ahead of other open web
+corpora for small models.  On top of that, every document passes `clean()`:
+
+    - whitespace normalised (no runs of blank lines / trailing spaces)
+    - dropped if shorter than `min_chars` or mostly non-text (`min_alpha_frac`)
+    - dropped if an exact duplicate of a document already kept
+    - followed by <|endoftext|> in the token stream, so the model sees where one
+      document ends instead of reading two unrelated texts as one
+
 PIPELINE, all steps cached so a re-run is a no-op:
 
     1. stream the dataset             (HF streaming -- never materialises 40GB)
     2. fit the BPE tokenizer           (only if missing, or fitted on another corpus)
-    3. tokenize to <cache>             (uint32 at the 199,995-token vocab)
+    3. tokenize to <cache>             (uint16 at the 16,384-token vocab)
+
+The cache has a `<cache>.json` sidecar naming the tokenizer that produced it; if
+the tokenizer is re-fitted the cache is rebuilt instead of silently reused.
 
 Under distributed training RANK 0 builds the cache and every other rank waits on
 a barrier before loading, so the download happens exactly once.
@@ -21,27 +35,53 @@ Memory: the token cache is built with np.concatenate + np.save, so peak RAM is
 roughly 2x the cache size (6 GB of chunks + 6 GB of the joined array at
 dataset.max_tokens = 1.5e9).  Lower max_tokens if that is a problem.
 """
+import hashlib
 import json
 import os
+import re
 import time
 
 import numpy as np
 
 DEFAULTS = {
-    'name': 'Skylion007/openwebtext',
-    'config': None,             # HF dataset config/subset name, or None
+    'name': 'HuggingFaceFW/fineweb-edu',
+    'config': 'sample-10BT',    # HF dataset config/subset name, or None
     'split': 'train',
     'text_field': 'text',
     'max_tokens': 1_500_000_000,
-    'cache': 'data/openwebtext_tokens.npy',
+    'cache': 'data/fineweb_edu_tokens.npy',
     'tokenizer': 'data/tokenizer/raslila_bpe.json',
-    'vocab_size': 199_995,
+    'vocab_size': 16_384,
     'train_tokenizer': True,
     'tokenizer_sample_chars': 300_000_000,
-    'shuffle_seed': None,
+    'shuffle_seed': 1234,       # shuffle buffer over the stream; None = file order
+    'shuffle_buffer': 10_000,
+    'min_chars': 200,           # drop stubs (nav pages, captions, "404")
+    'min_alpha_frac': 0.6,      # drop docs that are mostly symbols/numbers
+    'dedup': True,              # drop exact duplicates (after normalisation)
 }
 
-PAD_TOKEN = '<|pad|>'
+PAD_TOKEN = '<|pad|>'          # id 0; ignored by the loss
+EOS_TOKEN = '<|endoftext|>'    # id 1; separates documents in the token stream
+# Bump when the tokenizer recipe changes so an old fit is not silently reused.
+TOKENIZER_RECIPE = 'v2-eos-nfc'
+
+_BLANKS = re.compile(r'\n{3,}')
+_TRAILING = re.compile(r'[ \t]+\n')
+
+
+def clean(text, ds):
+    """Normalise one document; return None if it should be dropped."""
+    text = _TRAILING.sub('\n', text.replace('\r\n', '\n')).strip()
+    text = _BLANKS.sub('\n\n', text)
+    if len(text) < int(ds.get('min_chars') or 0):
+        return None
+    min_alpha = float(ds.get('min_alpha_frac') or 0.0)
+    if min_alpha > 0:
+        good = sum(1 for ch in text if ch.isalpha() or ch.isspace())
+        if good < min_alpha * len(text):
+            return None
+    return text
 
 
 def resolve(cfg):
@@ -82,14 +122,24 @@ def _open_stream(ds):
     return got
 
 
-def iter_texts(ds, max_chars=None, log=None):
-    """Yield non-empty documents from the configured text field.
+def iter_texts(ds, max_chars=None, log=None, stats=None):
+    """Yield cleaned, deduplicated documents from the configured text field.
 
     If `text_field` is absent (datasets disagree on the name), fall back to the
-    first string column rather than failing after a long download.
+    first string column rather than failing after a long download. `stats`, if
+    given, is a dict that receives kept/dropped counts.
     """
     src = _open_stream(ds)
+    if ds.get('shuffle_seed') is not None and hasattr(src, 'shuffle'):
+        # Without this the validation head is the first few crawl files only.
+        src = src.shuffle(seed=int(ds['shuffle_seed']),
+                          buffer_size=int(ds.get('shuffle_buffer') or 10_000))
     field = ds.get('text_field') or 'text'
+    seen_hashes = set() if ds.get('dedup', True) else None
+    if stats is None:
+        stats = {}
+    for key in ('kept', 'short_or_junk', 'duplicate'):
+        stats.setdefault(key, 0)
     total = 0
     seen = 0
     for row in src:
@@ -104,10 +154,22 @@ def iter_texts(ds, max_chars=None, log=None):
             text = row if isinstance(row, str) else None
         if not text:
             continue
+        text = clean(text, ds)
+        if text is None:
+            stats['short_or_junk'] += 1
+            continue
+        if seen_hashes is not None:
+            h = hashlib.blake2b(text.encode('utf-8'), digest_size=8).digest()
+            if h in seen_hashes:
+                stats['duplicate'] += 1
+                continue
+            seen_hashes.add(h)
+        stats['kept'] += 1
         seen += 1
         total += len(text)
-        if log and seen % 5000 == 0:
-            log('  ... {:,} docs, {:,} chars'.format(seen, total))
+        if log and seen % 50000 == 0:
+            log('  ... {:,} docs, {:,} chars (dropped {:,} short/junk, {:,} dup)'.format(
+                seen, total, stats['short_or_junk'], stats['duplicate']))
         yield text
         if max_chars is not None and total >= max_chars:
             return
@@ -122,8 +184,9 @@ def _source_tag(ds):
     means a smoke-test fit is correctly discarded by the real run instead of
     being silently reused.
     """
-    return '{}::{}::{}chars'.format(
-        ds['name'], ds.get('config') or '-', int(ds['tokenizer_sample_chars']))
+    return '{}::{}::{}chars::{}'.format(
+        ds['name'], ds.get('config') or '-', int(ds['tokenizer_sample_chars']),
+        TOKENIZER_RECIPE)
 
 
 def _read_meta_source(tok_path):
@@ -153,7 +216,7 @@ def ensure_tokenizer(ds, log=print):
     dataset and otherwise fits a fresh one -- so switching corpora re-fits
     automatically, and re-running does not.
     """
-    from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders
+    from tokenizers import Tokenizer, models, trainers, pre_tokenizers, decoders, normalizers
 
     path = ds['tokenizer']
     tag = _source_tag(ds)
@@ -182,11 +245,14 @@ def ensure_tokenizer(ds, log=print):
     t0 = time.time()
 
     tok = Tokenizer(models.BPE(unk_token=None))
+    # NFC: the same visible text always maps to the same bytes, so composed and
+    # decomposed accents do not get separate merges.
+    tok.normalizer = normalizers.NFC()
     tok.pre_tokenizer = pre_tokenizers.ByteLevel(add_prefix_space=False)
     tok.decoder = decoders.ByteLevel()
     trainer = trainers.BpeTrainer(
         vocab_size=int(ds['vocab_size']),
-        special_tokens=[PAD_TOKEN],   # -> id 0, keeps ignore_index=0 valid
+        special_tokens=[PAD_TOKEN, EOS_TOKEN],   # -> ids 0, 1; ignore_index=0 stays valid
         show_progress=False,
         min_frequency=2,
     )
@@ -202,11 +268,21 @@ def ensure_tokenizer(ds, log=print):
 def build_cache(ds, log=print, force=False):
     """Return the token array, downloading and caching it first if necessary."""
     cache = ds['cache']
+    sidecar = cache + '.json'
+    want = {'tokenizer_source': _source_tag(ds), 'dataset': ds['name'],
+            'config': ds.get('config'), 'max_tokens': int(ds['max_tokens'])}
     if os.path.exists(cache) and not force:
-        arr = np.load(cache, mmap_mode='r')
-        log('Corpus: {:,} tokens cached at {} (skipping download)'.format(
-            len(arr), cache))
-        return arr
+        have = None
+        if os.path.exists(sidecar):
+            with open(sidecar, 'r', encoding='utf-8') as f:
+                have = json.load(f)
+        if have is None or all(have.get(k) == v for k, v in want.items()):
+            arr = np.load(cache, mmap_mode='r')
+            log('Corpus: {:,} tokens cached at {} (skipping download)'.format(
+                len(arr), cache))
+            return arr
+        log('Corpus: {} was built from {}, this run wants {}; rebuilding.'.format(
+            cache, have, want))
 
     _require_datasets()
     tok_path = ensure_tokenizer(ds, log=log)
@@ -228,15 +304,35 @@ def build_cache(ds, log=print, force=False):
     total = 0
     docs = 0
     t0 = time.time()
-    for text in iter_texts(ds, log=log):
-        ids = tok.encode(text).ids
-        if not ids:
-            continue
-        chunks.append(np.asarray(ids, dtype=dtype))
-        total += len(ids)
-        docs += 1
-        if total >= max_tokens:
-            break
+    # encode_batch runs on all CPU cores; per-document encode() is single
+    # threaded and made a 1.5B-token build take most of a day.
+    batch = []
+
+    eos = tok.token_to_id(EOS_TOKEN)
+    if eos is None:
+        log('WARNING: tokenizer has no {}; documents will not be separated. '
+            'Set dataset.train_tokenizer: true to re-fit.'.format(EOS_TOKEN))
+    tail = [] if eos is None else [eos]
+    stats = {}
+
+    def flush():
+        nonlocal total, docs
+        for enc in tok.encode_batch(batch):
+            if enc.ids:
+                ids = enc.ids + tail
+                chunks.append(np.asarray(ids, dtype=dtype))
+                total += len(ids)
+                docs += 1
+        batch.clear()
+
+    for text in iter_texts(ds, log=log, stats=stats):
+        batch.append(text)
+        if len(batch) >= 1024:
+            flush()
+            if total >= max_tokens:
+                break
+    if batch and total < max_tokens:
+        flush()
     arr = np.concatenate(chunks) if chunks else np.zeros(0, dtype=dtype)
     del chunks
     if len(arr) > max_tokens:
@@ -244,9 +340,15 @@ def build_cache(ds, log=print, force=False):
 
     os.makedirs(os.path.dirname(cache) or '.', exist_ok=True)
     np.save(cache, arr)
-    log('Corpus: {:,} tokens from {:,} docs in {:.0f}s -> {} ({:.0f} MB)'.format(
-        len(arr), docs, time.time() - t0, cache,
-        os.path.getsize(cache) / 1e6))
+    with open(sidecar, 'w', encoding='utf-8') as f:
+        json.dump(dict(want, tokens=int(len(arr)), docs=docs,
+                       dropped_short_or_junk=stats.get('short_or_junk', 0),
+                       dropped_duplicate=stats.get('duplicate', 0)), f, indent=2)
+    log('Corpus: {:,} tokens from {:,} docs in {:.0f}s -> {} ({:.0f} MB); '
+        'dropped {:,} short/junk and {:,} duplicate docs'.format(
+            len(arr), docs, time.time() - t0, cache,
+            os.path.getsize(cache) / 1e6,
+            stats.get('short_or_junk', 0), stats.get('duplicate', 0)))
     return arr
 
 

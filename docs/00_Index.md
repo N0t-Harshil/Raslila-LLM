@@ -14,7 +14,7 @@ Original quantum research notes (15 files) are archived untouched in `../docs_or
 | [04 Training and Data](04_Training_and_Data.md) | Corpus, tokenization, schedules, CPU/GPU/TPU runbooks |
 | [05 Scorecards](05_Scorecards.md) | Per-component 0–10 scores and the honest verdict |
 | [06 Known Limitations](06_Known_Limitations.md) | What doesn't work; what 5T would actually require |
-| [**07 Brain Gap Analysis**](07_Brain_Gap_Analysis.md) | **What a real brain has that Raslila doesn't — 13 gaps, bad analogies, and a prioritised roadmap** |
+| [**07 Brain Gap Analysis**](07_Brain_Gap_Analysis.md) | **What a real brain has that Raslila doesn't — 13 gaps, bad analogies, a prioritised roadmap, and a measured "can it work like a brain?" check** |
 | [**08 Runbook**](08_Runbook_Bidirectional_Test.md) | **Commands for the current experiment: train A/B, compare, sample, then activate the next candidate one at a time** |
 
 Legacy top-level docs are retained and still accurate in spirit: `../README.md`,
@@ -26,13 +26,14 @@ Legacy top-level docs are retained and still accurate in spirit: `../README.md`,
 |---|---|
 | Model | Raslila — **5 layers × 5×5 2D sheets = 125 blocks**, hidden 256, **163,605,123 params**, 618 edges |
 | Structure | a conventional LLM is the degenerate 1D case; Raslila restores the 2D sheet per layer and stacks sheets in depth |
-| Wiring | **verified small-world**: `diagonal: false` (8-neighbour sheets) + `long_range_prob: 0.3` / `max_long_range: 8` (sparse long-range tracts). Was 618 edges / 4-neighbour; now 618. Costs +34% forward, +23% params |
+| Wiring | `config.yaml` (the A/B pair): original **618-edge** graph — 4-neighbour sheets, `long_range_prob: 0.1`, `max_long_range: 3`, held fixed so `depth_sweeps` is the only variable. `config_50m.yaml` / `config_20b.yaml`: brain-like small-world (`diagonal: true`, `0.3`, `8`) |
 | Active experiment | **`depth_sweeps: 2`** — the one variable under test. Feedback edges existed in the graph but were never traversed; the sweep makes flow bidirectional. 2× compute, 0 extra params |
 | Built but off | `inhibit`, `state_dim`, `replay_prob` — verified structurally, no measured loss gain, activated one at a time only if they win |
-| Objective | next-token prediction, **BPE 199,995 tokens** (5.43 chars/token) |
-| Corpus | HuggingFace **`Skylion007/openwebtext`**, **1.5B tokens cached**, auto-fetched on first run. Replaces 448 Gutenberg books / 85.2M tokens (deleted) |
+| Objective | next-token prediction, **BPE 16,384 tokens** (~4.3 chars/token on FineWeb-Edu), `<|endoftext|>` between documents |
+| Corpus | HuggingFace **`HuggingFaceFW/fineweb-edu`** (`sample-10BT`), **1.5B tokens cached**, auto-fetched, cleaned and deduplicated on first run; 2M tokens held out for val loss. Replaced openwebtext, which replaced 448 Gutenberg books / 85.2M tokens |
 | Proven wins | binding (−0.041), multidirectional cascades (−0.026), modern blocks (−0.27) |
 | Growth | cortical growth implemented (adds whole layers, clone-based birth) |
+| Training recipe | cosine LR to `min_lr`, AdamW (0.9, 0.95), no weight decay on norms/biases/scalars, batched edge networks, bf16 + TF32 |
 | Verdict | architecture 8/10, current model 3/10 — under-trained, not under-designed |
 
 > **Deep grid, not a chain.** `depth_layers` = sequential layers with *distinct

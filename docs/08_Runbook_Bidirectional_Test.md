@@ -15,8 +15,16 @@ vs 1 (feedforward). Everything else is identical.
 Both are **163,605,123 parameters** (125 blocks, 618 edges), so a loss difference
 can only come from the traversal direction. Both run with `inhibit: false`,
 `state_dim: 0`, `replay_prob: 0.0`, and both pull the same corpus
-(`data/corpus`, 448 Gutenberg books → 85,151,573 BPE-16k tokens) with the same
-wiring (`connectivity_seed: 42`).
+(HuggingFace FineWeb-Edu `sample-10BT`, 1.5B tokens, BPE-16k, cached at
+`data/fineweb_edu_tokens.npy`) with the same wiring (`connectivity_seed: 42`)
+and the same training recipe (cosine LR, 2M-token held-out val slice).
+
+> **Update, 2026-10 (later).** The corpus moved from Gutenberg to FineWeb-Edu
+> with document separators, the tokenizer was re-fitted on it, and the recipe
+> gained cosine decay and a weight-decay split. All of it was applied to **both**
+> arms identically — `scripts/check_configs.py` verifies the two files still
+> differ by `raslila.depth_sweeps` alone, so check that rather than this note.
+> Losses from earlier runs are not comparable; run both arms fresh.
 
 Verified: the two files differ by exactly one key (`raslila.depth_sweeps`).
 
@@ -50,35 +58,40 @@ Verified: the two files differ by exactly one key (`raslila.depth_sweeps`).
 
 ## Prerequisites
 
-The corpus is already cached locally and is **not** in git. It must be present
-before training, because `train_raslila.py` expects the directory:
+Nothing needs to be built by hand. The first training run (rank 0 under
+`torchrun`) does it and caches the result:
 
 ```
-data/corpus/               448 Gutenberg .txt files, ~299 MB
-data/corpus_tokens.npy     85,151,573 BPE-16k tokens  (162 MB)
-data/tokenizer/raslila_bpe.json   (committed; 13.9 MB)
+data/tokenizer/raslila_bpe.json   16,384-token BPE, re-fitted on FineWeb-Edu on the first run
+data/tokenizer/meta.json          records what the tokenizer was fitted on
+data/fineweb_edu_tokens.npy       1.5B tokens, uint16, ~3.0 GB
+data/fineweb_edu_tokens.npy.json  records the tokenizer + corpus that built it
 ```
 
-If you cloned fresh, build it in this order:
+Expect the first run to spend a while on this (tokenizer fit on 300M chars,
+then streaming and tokenizing 1.5B tokens) before step 0. To do it ahead of
+time, or to keep the smoke test below fast:
 
 ```bash
-python scripts/build_corpus.py         # -> data/corpus/*.txt
-python scripts/train_tokenizer.py      # -> data/tokenizer/
-python scripts/pretokenize_corpus.py   # -> data/corpus_tokens.npy
+python scripts/get_dataset.py --config config.yaml
 ```
 
-**Verify before a long run** — this catches the vocab/data mismatch that
-silently trains on garbage:
+**Verify before a long run:**
 
 ```bash
-python -c "import numpy as np,yaml; a=np.load('data/corpus_tokens.npy'); v=yaml.safe_load(open('config.yaml'))['raslila']['vocab_size']; print(len(a),a.max(),v,a.max()<v)"
-# expect:  85151573 16383 16384 True
-# if the last value is False the vocab does not match the data -> STOP
+python scripts/check_configs.py
+# expect: "A/B differs only by raslila.depth_sweeps (2 vs 1)"
+#         "All active config checks passed."
 ```
 
-`scripts/get_dataset.py` also exists and pulls a HuggingFace corpus, but the
-active configuration uses the Gutenberg pipeline above. Mixing the two will
-mismatch the cached tokenizer.
+The trainer itself refuses to start if the corpus contains a token id at or
+above `raslila.vocab_size`, and the cache sidecar forces a rebuild if the
+tokenizer changed — so the old "vocab does not match the data" failure cannot
+happen silently any more.
+
+The Gutenberg pipeline (`build_corpus.py`, `train_tokenizer.py`,
+`pretokenize_corpus.py`, `data/corpus/`) is only used if you delete the
+`dataset:` section from both configs.
 
 ---
 
@@ -182,7 +195,10 @@ most likely way to get a misleading result (a crashed run looks "better" simply
 because it never got worse).
 
 Raw curves: `<out-dir>/train_log.csv`, columns
-`step,lr,loss,alpha,beta,grad_norm,time_s`. Loss there is a windowed average.
+`step,lr,loss,val_loss,alpha,beta,grad_norm,time_s`. Loss there is a windowed
+average; `val_loss` is filled every `eval_every` steps from the held-out slice.
+`compare_runs.py` prints each run's final `val_loss` for reference, but the
+verdict stays on the training tail loss, as the decision rule was fixed in advance.
 
 **Checkpoint names are zero-indexed.** `--steps 20000` produces
 `raslila_step19999.pt`, not `step19000`. With `--save-every 2000` you get
@@ -218,7 +234,8 @@ python scripts/train_raslila.py \
 ```
 
 `--steps` is the **total** target, not the number of extra steps — it resumes and
-continues to 20000. Optimizer state, LR and plateau counters are restored.
+continues to 20000 (the trainer enforces this, and the cosine schedule ends at
+the same step). Optimizer state, LR and plateau counters are restored.
 
 ---
 

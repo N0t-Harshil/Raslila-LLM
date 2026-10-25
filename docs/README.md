@@ -35,17 +35,21 @@ no lateral connectivity, no binding.
 
 ## Current status at a glance
 
-- **Model**: **5 layers × 5×5 2D sheets = 125 blocks**, **1,114 edges** (brain-like
-  small-world wiring), **212.6M params** (`config.yaml`)
-- **Corpus**: HuggingFace `Skylion007/openwebtext`, **1.5B tokens**, downloaded and
-  tokenized automatically on first run — the old 85.2M-token Gutenberg corpus is gone
+- **Model**: **5 layers × 5×5 2D sheets = 125 blocks**, **618 edges**, **163.6M
+  params** (`config.yaml`, the depth_sweeps A/B pair). `config_50m.yaml` (68.9M)
+  and `config_20b.yaml` use the brain-like small-world wiring
+- **Corpus**: HuggingFace `HuggingFaceFW/fineweb-edu` (`sample-10BT`), **1.5B
+  tokens**, downloaded, cleaned, deduplicated and tokenized automatically on first
+  run, with `<|endoftext|>` between documents; 16,384-token BPE
 - **Loss**: historical CPU figure from an older 54M setup; not comparable to the current tokenizer and wiring.
 - **Verdict**: architecture 8/10, current model 3/10 (undertrained) — see [05](05_Scorecards.md)
 
-> **Two changes landed 2026-10** and both invalidate earlier checkpoints:
-> the corpus swapped to openwebtext, and the wiring went brain-like
-> (`diagonal: true`, `long_range_prob: 0.3`, `max_long_range: 8` — 618 → 1,114
-> edges). Details in [01](01_Architecture.md) and [04](04_Training_and_Data.md).
+> **2026-10 changes invalidate earlier checkpoints and loss numbers:** the
+> corpus is now FineWeb-Edu with document separators and a re-fitted tokenizer,
+> and the training recipe changed (cosine LR, no decay on norms/biases). The
+> brain-like wiring applies to the 50M/20B configs only; the A/B pair keeps the
+> 618-edge graph on purpose. Details in [01](01_Architecture.md),
+> [04](04_Training_and_Data.md) and the log in [02](02_Research_Log.md).
 
 ## What is still missing
 

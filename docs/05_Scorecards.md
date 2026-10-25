@@ -16,7 +16,7 @@ published results. 10 = best in class. Full table also in
 | 6 | RMSNorm + pre-norm + final norm | **8** | Final norm is load-bearing (init loss 110 without it). |
 | 7 | SwiGLU | **8** | Consistent literature win (−0.11). |
 | 8 | Edge networks (edges compute) | **8** | Core novelty; trains end-to-end. |
-| 9 | BPE vocabulary | **?** | Current 199,995-token setup; prior byte-level figures do not transfer. |
+| 9 | BPE vocabulary | **?** | Current 16,384-token BPE fitted on FineWeb-Edu with an `<|endoftext|>` separator; prior figures do not transfer. |
 | 10 | Init scheme (0.02 emb, zero-init roles) | **8** | Both measured at init (5.6 ≈ uniform 5.55). |
 | 11 | Learned node readout | **7** | Strictly more expressive than mean pooling; cheap. |
 | 12 | Deep-grid topology (2D sheets, stacked, with feedback) | **7** | Structurally sound; unproven vs plain stacking at scale. |
@@ -29,8 +29,8 @@ published results. 10 = best in class. Full table also in
 | 14 | Node role identity | **6** | Breaks symmetry; effect entangled with edges. |
 | 15 | QK-norm | **7** | Cheap insurance; not isolated yet. |
 | 16 | Tied embedding/head | **7** | Needs 0.02 init to not saturate. |
-| 17 | Adaptive LR + logging | **7** | Good operability; plateau decay froze learning once. |
-| 18 | Corpus pipeline | **7** | Rewritten 2026-10: 1.5B-token openwebtext corpus, auto-fetched. The 448-book version scored the same 7 and is deleted. |
+| 17 | LR schedule + logging | **8** | Cosine to `min_lr` is now the default (plateau decay froze learning once); val loss on a 2M-token held-out slice is logged. |
+| 18 | Corpus pipeline | **8** | FineWeb-Edu, 1.5B tokens, auto-fetched; whitespace cleanup, junk/duplicate filtering, shuffled stream, document separators, cache keyed to its tokenizer. |
 | 19 | α/β interference | **6** | Learns; small consistent effect. |
 | 20 | Multi-token prediction | **6** | Tie at 150 steps; best dormant candidate. |
 | 21 | Global workspace | **6** | Tie; redundant while edges suffice. |

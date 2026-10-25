@@ -53,9 +53,13 @@ raslila:
   layout: deep_grid
 
   # 125 regions, node_depth 11 -> 17.82B. See header for the arithmetic.
-  depth_layers: 5
-  grid_h: 5
-  grid_w: 5
+  # The grid: [layers, rows, cols] -- three independent numbers, any size.
+  # [5, 5, 5] = 5 stacked sheets of 5x5 blocks (125). [7, 3, 10] would be
+  # 7 sheets of 3x10 (210 blocks). Parameters scale with blocks and edges.
+  grid_shape: [5, 5, 5]
+  # Sheets of DIFFERENT sizes instead: one [rows, cols] per layer, shallow ->
+  # deep. Use this OR grid_shape, not both.
+  # layer_shapes: [[8, 8], [6, 6], [4, 4], [2, 2]]   # e.g. a pyramid
 
   num_layers: 1
   node_depth: 11          # 11 transformer blocks stacked per region
@@ -163,16 +167,23 @@ memory:
 # Legacy fallback: set training.data_dir to a dir of .txt files and remove
 # this section entirely.
 dataset:
-  name: "Skylion007/openwebtext"   # ~9.5B tokens of modern web text
+  # FineWeb-Edu: web text filtered for educational quality + deduplicated
+  # (arXiv 2406.17557). Replaces openwebtext; see src/raslila/hf_dataset.py.
+  name: "HuggingFaceFW/fineweb-edu"
+  config: "sample-10BT"            # ~10B-token random sample of the full set
   split: "train"
   text_field: "text"
-  max_tokens: 1500000000           # 1.5B tokens; uint32 cache = 6.0 GB
-  cache: "data/openwebtext_tokens.npy"
+  max_tokens: 1500000000           # 1.5B tokens; uint16 cache = 3.0 GB
+  cache: "data/fineweb_edu_tokens.npy"   # new name: never reuses an openwebtext cache
   tokenizer: "data/tokenizer/raslila_bpe.json"
   vocab_size: 16384                # must equal raslila.vocab_size
-  train_tokenizer: true            # re-fit BPE on openwebtext, then reuse it
+  train_tokenizer: true            # re-fit BPE (with <|endoftext|>) on this corpus, then reuse it
   tokenizer_sample_chars: 300000000
-  val_tokens: 0                 # optional stable validation prefix; 0 disables
+  shuffle_seed: 1234               # shuffle the stream so the val slice is a random sample
+  min_chars: 200                   # drop stub pages
+  min_alpha_frac: 0.6              # drop docs that are mostly symbols/numbers
+  dedup: true                      # drop exact duplicate documents
+  val_tokens: 2000000              # held-out head of the (shuffled) cache for val loss
 
 training:
   # batch 8 x seq 256 = 2048 tokens/rank. Small batch because at 20B the
@@ -194,6 +205,7 @@ training:
   eval_every: 500
 
   # Constant LR. See config_50m.yaml for why the plateau schedule is disabled.
+  lr_schedule: cosine      # warmup -> cosine decay to min_lr
   adaptive_lr: false
   lr_factor: 0.5
   lr_patience: 500

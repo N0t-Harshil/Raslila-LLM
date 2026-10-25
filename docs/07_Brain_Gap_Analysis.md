@@ -23,10 +23,12 @@ fine-tuning.
 
 | Brain property | Raslila | Verdict |
 |---|---|---|
-| 2D sheets stacked in depth | 5 layers × 5×5 sheets | **Good** — the core thesis holds |
+| 2D sheets stacked in depth | any `grid_shape: [layers, rows, cols]` (default 5 × 5×5), or sheets of different sizes via `layer_shapes` | **Good** — the core thesis holds |
 | Distinct cell types per layer | 5 homogeneous copies | **Missing** — see G7 |
 | Lateral connectivity | 4-neighbour within sheet | **Partial** — no distance decay, no long-range tuning |
-| Recurrent in time | none (attention window only) | **Missing, biggest gap** — G1 |
+| Recurrent in time | none (attention window only); `state_dim` built but off | **Missing, biggest gap** — G1 |
+| Variable thinking time | adaptive depth (`max_think_cycles`): stops when settled | **Partial** — built, untested on loss |
+| Always on, interruptible | `raslila_live.py`: rests when idle, takes input mid-answer | **Partial** — no learning while live |
 | Inhibition (~20% interneurons) | zero, all traffic excitatory | **Missing** — G2 |
 | Sparse activation (~1–5%) | dense: all 125 blocks every token | **Missing** — G3 |
 | Thalamic relay + gating | none, input hits all blocks | **Missing** — G4 |
@@ -373,6 +375,82 @@ thesis, and the thesis is now in good shape. What is missing is not another
 lateral connection; it is that the model has no memory of anything that is not in
 the attention window, cannot suppress a wrong answer, and never re-visits what it
 learned.
+
+## Can it work like a brain? A measured check (2026-10)
+
+Checked on the current code with small probe models (hidden 32, untrained), so
+these are statements about **structure and information flow**, not about
+quality. All numbers come from running the model, not from reading the design.
+
+### What it gets right (measured)
+
+- **Feedback between layers is real.** With `depth_sweeps: 2`, perturbing the
+  weights of the top sheet changes the bottom sheet's final state (max change
+  1.82). With `depth_sweeps: 1` the change is exactly 0. Information really does
+  flow back down, and only when the second sweep is on.
+- **It runs forward in time.** Changing token 10 alters the predictions at
+  positions 10, 11, 12, ... and none before 10. A token only affects the tokens
+  after it, never earlier ones.
+- **The wiring is sparse and local.** `config.yaml` has 618 edges among 125
+  blocks: about 5 connections per block, 4.0% of all possible pairs, plus
+  long-range shortcuts. That is the brain's "small-world" pattern (dense local,
+  sparse long-range), though at a vastly smaller scale.
+- **It can think longer on hard input** (adaptive depth, `max_think_cycles`):
+  it stops after 1 cycle when the prediction is confident or has stopped
+  changing, and loops through the grid up to the cap otherwise. The live session
+  (`scripts/raslila_live.py`) **stays running** when idle, frees GPU memory
+  while resting, and accepts input mid-answer.
+- **The grid can be any shape.** `grid_shape: [layers, rows, cols]` takes three
+  independent numbers (checked at [7,3,10], [2,9,4], [10,2,2], [1,1,12]), and
+  `layer_shapes` allows sheets of different sizes, e.g. a pyramid.
+
+### What's still missing
+
+- **Every block works on every token** (125 of 125, 100%). In cortex only a few
+  percent of neurons fire at once; this is the main reason brains are so
+  energy-efficient (G3).
+- **It doesn't learn while you talk to it.** During a live conversation the
+  weights stay frozen; its only memory is the last 128 tokens of context. A
+  brain changes itself from every experience (G6, G10).
+- **No memory carried over time and no inhibition.** Both are built
+  (`state_dim`, `inhibit`) but switched off, and neither has been tested in a
+  real training run for whether it helps (G1, G2).
+- **It learns by backpropagation**, which brains almost certainly don't use.
+- **The blocks are ordinary transformers, not neurons.** A block is an
+  engineering unit with no anatomical counterpart (see "Bad analogy 2" above).
+
+### Evidence that it works better than a normal model
+
+Weak so far. Against a well-tuned GPT of the same size it is on par per
+parameter, not ahead ([06](06_Known_Limitations.md)). The measured gains are
+small: binding −0.041 nats, multidirectional cascades −0.026, the modern block
+recipe −0.27 (the last is not specific to this architecture). Every result
+comes from under 0.2 epochs of training.
+
+### Assessment
+
+It has potential as a research direction. The layout is a reasonable bet on
+structure that might help a model learn. But a "brain-like layout" does not mean
+it "works like a brain", and only training can show whether the structure pays
+off.
+
+### What would actually tell us
+
+Two runs on the A100, both measurable:
+
+1. **The depth_sweeps A/B** that is already set up (`scripts/run_ab.py`): does
+   feedback (2 sweeps) beat feedforward (1 sweep) at equal steps?
+2. **`config_adaptive.yaml`** against fixed depth: does adaptive thinking beat
+   it at equal compute, and how often does a trained model stop early?
+
+### Biggest next steps toward a brain
+
+1. **Learning during the live session**: let it update its own weights from what
+   it is told, with replay so it does not forget what it already knew (G6, G8, G10).
+2. **Sparse activation**: run only the most relevant blocks per token instead of
+   all of them (G3, roadmap item 10).
+
+---
 
 ## What not to build
 

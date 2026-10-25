@@ -129,7 +129,8 @@ def analytic_params(b3):
         per_edge = 2 * H * ehd + ehd + ehd * H + H
     else:
         per_edge = 0
-    n_nodes = b3['depth_layers'] * b3['grid_h'] * b3['grid_w']
+    g = RaslilaConfig(**b3)   # resolves grid_shape -> depth_layers/grid_h/grid_w
+    n_nodes = g.depth_layers * g.grid_h * g.grid_w
     # measured edge:node ratio on the current 5x5 production grid is 1114/125
     n_edges = int(round(n_nodes * 1114 / 125))
     emb = b3['vocab_size'] * H + H

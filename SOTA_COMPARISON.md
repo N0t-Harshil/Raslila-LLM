@@ -1,21 +1,23 @@
 # Raslila vs State-of-the-Art: Component-by-Component Ranking
 
-> **Historical document (2026-09) — read with care.** Two changes landed in
-> 2026-10: the training corpus moved to HuggingFace `Skylion007/openwebtext`
-> (1.5B tokens, auto-fetched), and the wiring went brain-like
-> (`diagonal: true`, `long_range_prob: 0.3`, `max_long_range: 8` — 618 → 1,114
-> edges at 5×5×5, 163.6M → 212.6M params at hidden 256). Every parameter count,
-> corpus figure and "current training" claim below predates both, and every
-> checkpoint from before is unloadable. For current state see
-> [`docs/00_Index.md`](docs/00_Index.md).
+> **Historical document (2026-09) — read with care.** Every parameter count,
+> corpus figure and "current training" claim below predates the 2026-10
+> changes, and every checkpoint from before is unloadable. Current state, as
+> checked by `scripts/check_configs.py`:
 >
-> **Third change (also 2026-10).** The tokenizer was upgraded from a
-> 16,384-token BPE to a **199,995-token** one (measured 5.43 vs 3.34
-> chars/token). That alone adds 47M parameters at hidden 256 and moves the
-> token cache to uint32 / 6.0 GB. The `config_3m.yaml` and `config_15m.yaml`
-> files referenced below were deleted; only `config.yaml` (260M),
-> `config_50m.yaml` (92.6M), `config_20b.yaml` (21.0B) and
-> `config_baseline_feedforward.yaml` remain.
+> - **Corpus:** HuggingFace `HuggingFaceFW/fineweb-edu` (`sample-10BT`), 1.5B
+>   tokens, auto-fetched, cleaned, deduplicated, with `<|endoftext|>` between
+>   documents (openwebtext was used briefly in between and is superseded).
+> - **Tokenizer:** 16,384-token BPE re-fitted on that corpus. A 199,995-token
+>   vocab was trialled and not adopted.
+> - **Configs:** `config.yaml` / `config_baseline_feedforward.yaml` are 163.6M
+>   params on the original 618-edge wiring (the depth_sweeps A/B pair);
+>   `config_50m.yaml` is 68.9M and `config_20b.yaml` 21.0B, both with the
+>   brain-like wiring (`diagonal: true`, `long_range_prob: 0.3`,
+>   `max_long_range: 8`). `config_3m.yaml` and `config_15m.yaml`, referenced
+>   below, were deleted.
+>
+> For current state see [`docs/00_Index.md`](docs/00_Index.md).
 
 
 > **Disclaimer**: This analysis compares architectural *principles* and *potential* at scale.
@@ -267,7 +269,7 @@ byte windows (our A/Bs) and published ablations. 10 = best-in-class.
 | 12 | QK-norm | 7 | Cheap stability insurance (Gemma/OLMo/Qwen practice); no isolated measurement yet. |
 | 13 | Tied embedding/head | 7 | Saves params, standard; needs 0.02 init (init loss 45 without it). |
 | 14 | BPE vocab 16,384 | 9 | 3.34 chars/token vs bytes' 1.0 — 3.6× fewer steps per epoch, the single biggest quality lever we pulled |
-| 15 | Adaptive LR + per-step logging | 7 | Good operability; plateau decay froze learning at 0.2 epochs once — needs gentler schedule for long runs. |
+| 15 | Adaptive LR + per-step logging | 7 | Good operability; plateau decay froze learning at 0.2 epochs once — needs gentler schedule for long runs. *(2026-10: cosine is now the default.)* |
 | 16 | Gutenberg byte pipeline (10.5M tokens) | 7 | Real text, correct; only 0.2 epochs seen so far — data is not the bottleneck, training budget is. |
 | 17 | Init scheme (0.02 emb, zero-init roles) | 8 | Both choices measured at init (5.6 ≈ uniform 5.55). |
 | 18 | LNS (depth-scaled norms) | 5 | Implemented, config-gated; A/B at our depth: no gain (2.484 vs 2.487 = noise). Revisit if node_depth grows large. |

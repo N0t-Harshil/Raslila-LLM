@@ -71,9 +71,10 @@ BASE = dict(
 
 def corpus(n=1_500_000):
     """Real English text as BPE ids (production tokenization)."""
-    # data/corpus_tokens.npy was deleted with the 2026-10 corpus swap;
-    # data/openwebtext_tokens.npy is the production cache now.
-    for path in ('data/openwebtext_tokens.npy', 'data/corpus_tokens.npy'):
+    # data/fineweb_edu_tokens.npy is the production cache; the older caches are
+    # accepted only if that one has not been built yet.
+    for path in ('data/fineweb_edu_tokens.npy', 'data/openwebtext_tokens.npy',
+                 'data/corpus_tokens.npy'):
         if os.path.exists(path):
             break
     else:

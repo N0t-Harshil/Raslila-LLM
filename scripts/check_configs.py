@@ -11,7 +11,10 @@ ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)),
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 from raslila.raslila import RaslilaConfig
 
-CONFIGS = ['config.yaml', 'config_baseline_feedforward.yaml', 'config_50m.yaml', 'config_20b.yaml']
+AB_CONFIGS = ['config.yaml', 'config_baseline_feedforward.yaml']
+# config_adaptive.yaml = config.yaml + adaptive depth; same graph as the A/B pair.
+ORIGINAL_WIRING = AB_CONFIGS + ['config_adaptive.yaml']
+CONFIGS = ORIGINAL_WIRING + ['config_50m.yaml', 'config_20b.yaml']
 TRAINER = os.path.join(ROOT, 'scripts', 'train_raslila.py')
 
 
@@ -52,9 +55,15 @@ def main():
         r = raw['raslila']
         if name == 'config_20b.yaml' and r.get('node_depth') != 11:
             failures.append('{}: shipped 4x A100 shape requires node_depth 11'.format(name))
-        if not (r.get('diagonal') is True and r.get('long_range_prob') == 0.3
-                and r.get('max_long_range') == 8):
-            failures.append('{}: brain-like wiring invariant failed'.format(name))
+        # The depth_sweeps A/B pair deliberately keeps the original 618-edge
+        # wiring so the graph is fixed while the sweep is tested; the 50M/20B
+        # shapes use the brain-like small-world wiring.
+        if name in ORIGINAL_WIRING:
+            wiring = (False, 0.1, 3)
+        else:
+            wiring = (True, 0.3, 8)
+        if (r.get('diagonal'), r.get('long_range_prob'), r.get('max_long_range')) != wiring:
+            failures.append('{}: wiring must be diagonal/long_range_prob/max_long_range = {}'.format(name, wiring))
         print('{}: parsed; vocab={}; wiring=valid'.format(name, r.get('vocab_size')))
     a, b = load('config.yaml'), load('config_baseline_feedforward.yaml')
     diffs = []

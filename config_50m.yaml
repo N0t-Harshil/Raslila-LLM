@@ -68,9 +68,13 @@ raslila:
   layout: deep_grid
 
   # Production topology from config.yaml, narrowed to reach 50M.
-  depth_layers: 5
-  grid_h: 5
-  grid_w: 5              # -> 125 blocks, 1114 edges
+  # The grid: [layers, rows, cols] -- three independent numbers, any size.
+  # [5, 5, 5] = 5 stacked sheets of 5x5 blocks (125). [7, 3, 10] would be
+  # 7 sheets of 3x10 (210 blocks). Parameters scale with blocks and edges.
+  grid_shape: [5, 5, 5]
+  # Sheets of DIFFERENT sizes instead: one [rows, cols] per layer, shallow ->
+  # deep. Use this OR grid_shape, not both.
+  # layer_shapes: [[8, 8], [6, 6], [4, 4], [2, 2]]   # e.g. a pyramid
 
   num_layers: 1
   node_depth: 1
@@ -172,16 +176,23 @@ memory:
 # The old 85,151,573-token Gutenberg corpus is retired -- at 30k steps x 4096
 # tok/step this run alone consumes 122.9M tokens, i.e. 1.4 epochs of it.
 dataset:
-  name: "Skylion007/openwebtext"   # ~9.5B tokens of modern web text
+  # FineWeb-Edu: web text filtered for educational quality + deduplicated
+  # (arXiv 2406.17557). Replaces openwebtext; see src/raslila/hf_dataset.py.
+  name: "HuggingFaceFW/fineweb-edu"
+  config: "sample-10BT"            # ~10B-token random sample of the full set
   split: "train"
   text_field: "text"
-  max_tokens: 1500000000           # 1.5B tokens (20x a 50M model, Chinchilla)
-  cache: "data/openwebtext_tokens.npy"   # 6.0 GB, uint32
+  max_tokens: 1500000000           # 1.5B tokens; uint16 cache = 3.0 GB
+  cache: "data/fineweb_edu_tokens.npy"   # new name: never reuses an openwebtext cache
   tokenizer: "data/tokenizer/raslila_bpe.json"
   vocab_size: 16384                # must equal raslila.vocab_size
-  train_tokenizer: true            # re-fit BPE on openwebtext, then reuse it
+  train_tokenizer: true            # re-fit BPE (with <|endoftext|>) on this corpus, then reuse it
   tokenizer_sample_chars: 300000000
-  val_tokens: 0                 # optional stable validation prefix; 0 disables
+  shuffle_seed: 1234               # shuffle the stream so the val slice is a random sample
+  min_chars: 200                   # drop stub pages
+  min_alpha_frac: 0.6              # drop docs that are mostly symbols/numbers
+  dedup: true                      # drop exact duplicate documents
+  val_tokens: 2000000              # held-out head of the (shuffled) cache for val loss
 
 training:
   # TPU prefers a large batch to keep the matrix units fed: 32 x 128 = 4096
@@ -205,11 +216,11 @@ training:
   # the LR to the 1e-5 floor by step ~3250 and spent the next 5.1M tokens
   # (5750 steps) for only 0.059 nats, versus 0.35 nats for the 3.3M tokens
   # before it. ~10x less token-efficient. Do not turn this on.
+  lr_schedule: cosine      # warmup -> cosine decay to min_lr
   adaptive_lr: false
   lr_factor: 0.5
   lr_patience: 500
   lr_threshold: 0.001
-  min_lr: 1.0e-5
   min_lr: 1.0e-5
 
 distributed:

@@ -57,12 +57,15 @@ the answer is actually obtainable.
   passes per forward, plus 618 edge-MLP calls per sweep issued from a Python
   loop. Measured 7.4 s/step on CPU at batch 2 × seq 64. This is launch-bound on
   GPU and CPU-bound locally. It is the direct cost of the grid thesis and has not
-  been optimised away. Batching the edge networks or using a vectorised sparse
-  gather is the obvious next engineering step. Adding `num_layers` cascades
+  been fully optimised away. **Partly addressed (2026-10):** each block's
+  incoming edge networks now run as one batched matmul instead of a Python loop
+  over edges (same numbers, ~10-20% faster on CPU; the GPU gain is expected to
+  be larger but is unmeasured). The 125 blocks themselves still run one at a
+  time. Adding `num_layers` cascades
   multiplies this linearly (2 rounds ≈ 1.9× step time, same parameters).
 - **Edge parameters grow with the grid.** At 125 blocks the 618 edge networks
-  are **42% of the model** (110M of 260M with the brain-like wiring; it was 29%,
-  61M of 211M, at the old 618-edge wiring), and their count scales linearly with
+  are **37% of `config.yaml`** (61.0M of 163.6M at 618 edges; more with the
+  brain-like wiring of the 50M/20B configs), and their count scales linearly with
   regions × neighbours. `edge_hidden_dim` is the trim lever, but shrinking it
   weakens the edge-compute idea that is the architecture's core novelty.
 - **Most exotic mechanisms tie.** LNS, gating, MTP, workspace, top-k, priority —
@@ -87,8 +90,8 @@ Byte-level cost ~4× the tokens per unit of language versus BPE. At fixed comput
 that is a 4× smaller effective dataset, and it was the largest single cause of the
 garbage-looking output.
 
-**RESOLVED:** we now train on BPE-200k at 5.43 chars/token, cutting one epoch
-from ~150k steps to ~51k (at batch 8 × seq 128). See
+**RESOLVED:** we now train on a 16,384-token BPE (~4.3 chars/token on
+FineWeb-Edu), and the corpus is large enough that no run crosses an epoch. See
 [04_Training_and_Data.md](04_Training_and_Data.md).
 
 ## The architecture is spatial, and brains are temporal
@@ -106,13 +109,11 @@ Full audit with fixes and a ranked roadmap:
 
 ## Over-parameterised for the data we have
 
-260M parameters against 1.5B tokens — still well under one epoch, and 1.63× more
-text per token than before. The model has more capacity than the budget can
-usefully fill, which is the mirror image of the byte-level problem — we fixed
-token efficiency, and now the grid is larger than the budget justifies. If the
-loss plateaus early, `config_50m.yaml` (92.6M, or 78.9M at
-`edge_hidden_dim: 64`) will train further on the same compute.
-the same compute. The 5 × (5×5) grid is the right architecture to *have*; whether
+163.6M parameters against a 20k-step run that sees 164M tokens — about one
+token per parameter, against Chinchilla's ~20. The model has more capacity than
+the budget can usefully fill, which is the mirror image of the byte-level
+problem. If the loss plateaus early, `config_50m.yaml` (68.9M) will train
+further on the same compute. The 5 × (5×5) grid is the right architecture to *have*; whether
 it is the right size to *train now* is a budget question, not a design one.
 
 ## Gaps against a real brain

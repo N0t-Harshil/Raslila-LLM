@@ -23,7 +23,9 @@ def read_run(run_dir):
     if not rows:
         return None
     losses = [float(r['loss']) for r in rows]
+    vals = [float(r['val_loss']) for r in rows if r.get('val_loss')]
     return {
+        'val': vals[-1] if vals else None,
         'csv': files[0],
         'steps': int(float(rows[-1]['step'])),
         'n_rows': len(rows),
@@ -55,8 +57,11 @@ def main():
 
     for name, r in ((args.run_a, a), (args.run_b, b)):
         t = r['last5'][-args.tail:]
-        print('{:<16s} steps={:<7d} tail({})={:.4f}  best={:.4f}'.format(
-            name, r['steps'], len(t), sum(t) / len(t), r['best']))
+        # Final held-out loss is shown for reference only; the verdict below
+        # stays on the training tail loss, as the rule was fixed in advance.
+        print('{:<16s} steps={:<7d} tail({})={:.4f}  best={:.4f}  final_val={}'.format(
+            name, r['steps'], len(t), sum(t) / len(t), r['best'],
+            'n/a' if r['val'] is None else '{:.4f}'.format(r['val'])))
     print()
 
     if args.min_steps and (a['steps'] < args.min_steps or b['steps'] < args.min_steps):

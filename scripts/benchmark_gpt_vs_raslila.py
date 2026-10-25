@@ -100,13 +100,16 @@ def run_validate_wins(args, seeds):
     unknown = sorted(set(rc) - valid_fields)
     if unknown:
         raise SystemExit('Unknown Raslila config fields: {}'.format(unknown))
-    if ds.get('name') != 'Skylion007/openwebtext' or ds.get('vocab_size') != 199995 or rc.get('vocab_size') != 199995:
-        raise SystemExit('--validate-wins requires the current OpenWebText dataset and matching 199995-token BPE vocabulary.')
-    if (rc.get('depth_layers') != 5 or rc.get('grid_h') != 5 or rc.get('grid_w') != 5
+    from raslila.hf_dataset import resolve as resolve_dataset, _source_tag
+    ds = resolve_dataset(ds)
+    if ds.get('vocab_size') != rc.get('vocab_size'):
+        raise SystemExit('--validate-wins requires dataset.vocab_size == raslila.vocab_size.')
+    g = RaslilaConfig(**rc)   # resolves grid_shape -> depth_layers/grid_h/grid_w
+    if ((g.depth_layers, g.grid_h, g.grid_w) != (5, 5, 5) or g.layer_shapes
             or rc.get('diagonal') is not True or float(rc.get('long_range_prob', -1)) != 0.3
             or int(rc.get('max_long_range', -1)) != 8):
         raise SystemExit('--validate-wins requires the current 5x5x5 layout and wiring: diagonal=true, long_range_prob=0.3, max_long_range=8.')
-    cache = ds.get('cache', 'data/openwebtext_tokens.npy')
+    cache = ds['cache']
     cache_path = cache if os.path.isabs(cache) else os.path.join(_ROOT, cache)
     if not os.path.exists(cache_path):
         raise SystemExit('Current token cache not found at {}. Prepare the current dataset on the GPU server first.'.format(cache_path))
@@ -117,9 +120,10 @@ def run_validate_wins(args, seeds):
         raise SystemExit('Current fitted BPE tokenizer and meta.json are required; prepare the dataset first.')
     with open(meta_path, encoding='utf-8') as f:
         meta = json.load(f)
-    expected_source = '{}::-::{}chars'.format(ds.get('name'), int(ds.get('tokenizer_sample_chars', 0)))
-    if meta.get('source') != expected_source or int(meta.get('vocab_size', 0)) != 199995:
-        raise SystemExit('Tokenizer metadata does not match the current OpenWebText 300M-char, 199995-token fit.')
+    expected_source = _source_tag(ds)
+    if meta.get('source') != expected_source or int(meta.get('vocab_size', 0)) != int(ds['vocab_size']):
+        raise SystemExit('Tokenizer metadata {} does not match the configured fit {} (vocab {}).'.format(
+            meta.get('source'), expected_source, ds['vocab_size']))
     try:
         from tokenizers import Tokenizer
         actual_vocab = Tokenizer.from_file(tokenizer_path).get_vocab_size()

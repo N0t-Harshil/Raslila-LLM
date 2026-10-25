@@ -26,7 +26,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
-from typing import Dict
+from typing import Dict, List, Optional
 from dataclasses import dataclass
 import math
 import random
@@ -70,6 +70,25 @@ class RaslilaConfig:
     depth_layers: int = 5   # sequential layers (cortical sheets)
     grid_h: int = 5         # rows per layer
     grid_w: int = 5         # blocks per row
+    # Any shape: one [rows, cols] sheet per layer, deepest last. Overrides
+    # depth_layers/grid_h/grid_w when set, so layers can differ in size the way
+    # cortical areas do -- e.g. a pyramid [[8, 8], [6, 6], [4, 4], [2, 2]], a
+    # funnel, an hourglass, or a single long strip [[1, 32]]. None = a uniform
+    # depth_layers x grid_h x grid_w box (the old behaviour, bit-identical).
+    layer_shapes: Optional[List[List[int]]] = None
+    # The grid as three independent numbers in one place: [layers, rows, cols],
+    # e.g. [7, 3, 10] = 7 stacked sheets of 3 x 10 blocks (210 blocks). Sets
+    # depth_layers/grid_h/grid_w; 5 x 5 x 5 is only the default, not a rule.
+    grid_shape: Optional[List[int]] = None
+
+    def __post_init__(self):
+        if self.grid_shape is not None:
+            if len(self.grid_shape) != 3 or any(int(v) < 1 for v in self.grid_shape):
+                raise ValueError('grid_shape must be [layers, rows, cols], each >= 1; got {}'
+                                 .format(self.grid_shape))
+            if self.layer_shapes:
+                raise ValueError('set grid_shape OR layer_shapes, not both')
+            self.depth_layers, self.grid_h, self.grid_w = (int(v) for v in self.grid_shape)
     layout: str = 'deep_grid'   # 'deep_grid' | 'flat3d' (legacy flat lattice)
 
     # Region configuration
@@ -84,6 +103,17 @@ class RaslilaConfig:
                               # 1 = plain bottom-up (no real feedback).
                               # 2 = up then down (recommended minimum).
                               # 3+ = repeated refinement passes.
+    # Adaptive depth ("think until settled"). 0 = off: depth_sweeps is used and
+    # behaviour is unchanged. N > 0 replaces depth_sweeps with up to N thinking
+    # cycles (cycle 1 = one bottom-up pass; each further cycle = down + up), with
+    # a readout after every cycle. At inference the loop stops as soon as the
+    # next-token prediction is confident or stops changing, so easy inputs leave
+    # early and hard ones loop longer. Training scores every cycle's readout
+    # (deep supervision) so an early exit is a real answer, not a half-thought.
+    max_think_cycles: int = 0
+    halt_at_inference: bool = True
+    halt_confidence: float = 0.9  # stop when max next-token prob reaches this
+    halt_tol: float = 0.02        # ...or when it moved less than this (total variation)
 
     num_layers: int = 1     # cascade rounds INSIDE each layer (multidirectional)
     node_depth: int = 1     # transformer blocks per region
@@ -590,15 +620,31 @@ class Raslila(nn.Module):
             self.n_layers = max(1, int(config.depth_layers))
             self.grid_h = max(1, int(config.grid_h))
             self.grid_w = max(1, int(config.grid_w))
-        self.per_layer = self.grid_h * self.grid_w
-        self.n_nodes = self.n_layers * self.per_layer
+        if self.layout == 'deep_grid' and getattr(config, 'layer_shapes', None):
+            shapes = [(int(h), int(w)) for h, w in config.layer_shapes]
+            if any(h < 1 or w < 1 for h, w in shapes):
+                raise ValueError('layer_shapes entries must be [rows >= 1, cols >= 1], got {}'
+                                 .format(config.layer_shapes))
+        else:
+            shapes = [(self.grid_h, self.grid_w)] * self.n_layers
+        # Per-layer sheet shapes and the contiguous block-id range of each layer.
+        # Everything that walks the grid goes through these two lists, so the
+        # grid can be any shape: layers need not share a size.
+        self.layer_shapes = shapes
+        self.layer_ranges = []
+        start = 0
+        for h, w in shapes:
+            self.layer_ranges.append((start, start + h * w))
+            start += h * w
+        self.n_layers = len(shapes)
+        self.n_nodes = start
+        # Kept for the uniform case (and old callers): blocks per layer.
+        self.per_layer = shapes[0][0] * shapes[0][1]
+        self.grid_h, self.grid_w = shapes[0]
 
         self.register_buffer('node_positions', self._create_positions())
-        # index of each block within its layer, per layer: layer -> [block ids]
-        self.register_buffer(
-            'layer_index',
-            torch.tensor([[l * self.per_layer + i for i in range(self.per_layer)]
-                          for l in range(self.n_layers)], dtype=torch.long))
+        # Block ids of each layer, padded with -1 when layers differ in size.
+        self.register_buffer('layer_index', self._layer_index_table())
 
         self.token_embedding = nn.Embedding(config.vocab_size, config.hidden_dim)
         # GPT-2-style small init: with a tied output head, logits are h·E, so
@@ -752,11 +798,32 @@ class Raslila(nn.Module):
                     for x in range(self.config.dim_x):
                         positions.append([x, y, z])
         else:
-            for l in range(self.n_layers):
-                for r in range(self.grid_h):
-                    for c in range(self.grid_w):
+            for l, (h, w) in enumerate(self.layer_shapes):
+                for r in range(h):
+                    for c in range(w):
                         positions.append([c, r, l])
         return torch.tensor(positions, dtype=torch.float32)
+
+    def _layer_index_table(self):
+        width = max(e - s for s, e in self.layer_ranges)
+        return torch.tensor([list(range(s, e)) + [-1] * (width - (e - s))
+                             for s, e in self.layer_ranges], dtype=torch.long)
+
+    def layer_ids(self, layer):
+        """Block ids belonging to `layer` (0 = first/shallowest)."""
+        s, e = self.layer_ranges[layer]
+        return list(range(s, e))
+
+    @staticmethod
+    def _map_cell(r, c, src_shape, dst_shape):
+        """Cell in a dst sheet at the same relative position as (r, c) in src.
+
+        Centre-to-centre scaling, so equal shapes map a cell onto itself and a
+        larger sheet funnels several cells into one cell of a smaller one.
+        """
+        (h1, w1), (h2, w2) = src_shape, dst_shape
+        return (min(h2 - 1, int((r + 0.5) * h2 / h1)),
+                min(w2 - 1, int((c + 0.5) * w2 / w1)))
 
     def _build_connectivity(self):
         """Structured deep-grid connectivity.
@@ -773,24 +840,27 @@ class Raslila(nn.Module):
 
         cfg = self.config
 
+        shapes = self.layer_shapes
+
         def bid(l, r, c):
-            return l * self.per_layer + r * self.grid_w + c
+            return self.layer_ranges[l][0] + r * shapes[l][1] + c
 
         for l in range(self.n_layers):
+            h, w = shapes[l]
             # lateral, inside the layer
-            for r in range(self.grid_h):
-                for c in range(self.grid_w):
+            for r in range(h):
+                for c in range(w):
                     i = bid(l, r, c)
                     if cfg.lateral:
                         for dr, dc in ((0, 1), (0, -1), (1, 0), (-1, 0)):
                             nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_h and 0 <= nc < self.grid_w:
+                            if 0 <= nr < h and 0 <= nc < w:
                                 j = bid(l, nr, nc)
                                 adj[j, i] = True   # neighbour sends INTO i
                     if cfg.diagonal:
                         for dr, dc in ((1, 1), (1, -1), (-1, 1), (-1, -1)):
                             nr, nc = r + dr, c + dc
-                            if 0 <= nr < self.grid_h and 0 <= nc < self.grid_w:
+                            if 0 <= nr < h and 0 <= nc < w:
                                 adj[bid(l, nr, nc), i] = True
             # vertical, between layers
             if cfg.vertical:
@@ -800,23 +870,30 @@ class Raslila(nn.Module):
                     # but connectivity WITHIN a sheet stays local -- which is
                     # the direction cortex actually goes: sparse local wiring,
                     # dense long-range projections between areas.
-                    for r1 in range(self.grid_h):
-                        for c1 in range(self.grid_w):
-                            for r2 in range(self.grid_h):
-                                for c2 in range(self.grid_w):
-                                    if l + 1 < self.n_layers:
-                                        adj[bid(l, r1, c1),
-                                            bid(l + 1, r2, c2)] = True
-                                    if cfg.feedback and l - 1 >= 0:
-                                        adj[bid(l, r1, c1),
-                                            bid(l - 1, r2, c2)] = True
-                else:
-                    for r in range(self.grid_h):
-                        for c in range(self.grid_w):
-                            if l + 1 < self.n_layers:
-                                adj[bid(l, r, c), bid(l + 1, r, c)] = True
-                            if cfg.feedback and l - 1 >= 0:
-                                adj[bid(l, r, c), bid(l - 1, r, c)] = True
+                    s0, e0 = self.layer_ranges[l]
+                    if l + 1 < self.n_layers:
+                        s1, e1 = self.layer_ranges[l + 1]
+                        adj[s0:e0, s1:e1] = True
+                    if cfg.feedback and l - 1 >= 0:
+                        s1, e1 = self.layer_ranges[l - 1]
+                        adj[s0:e0, s1:e1] = True
+                elif l + 1 < self.n_layers:
+                    # Same relative position in the next sheet. Mapped in BOTH
+                    # directions so that when sheets differ in size every cell
+                    # of each still gets a vertical link (equal sizes: both
+                    # maps are the identity, i.e. same cell above and below).
+                    up = shapes[l + 1]
+                    pairs = set()
+                    for r in range(h):
+                        for c in range(w):
+                            pairs.add(((r, c), self._map_cell(r, c, shapes[l], up)))
+                    for r in range(up[0]):
+                        for c in range(up[1]):
+                            pairs.add((self._map_cell(r, c, up, shapes[l]), (r, c)))
+                    for (r, c), (r2, c2) in pairs:
+                        adj[bid(l, r, c), bid(l + 1, r2, c2)] = True    # feedforward
+                        if cfg.feedback:
+                            adj[bid(l + 1, r2, c2), bid(l, r, c)] = True  # feedback
 
         # Sparse long-range shortcuts (small-world), never duplicating a link.
         # A LOCAL Random instance, not random.seed(...): calling the module-level
@@ -901,8 +978,10 @@ class Raslila(nn.Module):
         if self.layout == 'deep_grid':
             # A grown block is a whole new cortical sheet cell; keep its layer
             # coordinate one past the deepest existing layer.
+            # The new sheet copies the deepest sheet's shape.
+            gh, gw = self.layer_shapes[-1]
             extra = [[c, r, int(pos[:, 2].max()) + 1]
-                     for r in range(self.grid_h) for c in range(self.grid_w)]
+                     for r in range(gh) for c in range(gw)]
             extra = extra[:n_new]
             n_new = len(extra)
             if n_new == 0:
@@ -931,13 +1010,11 @@ class Raslila(nn.Module):
         # 2. Grow the block count, keeping the old indices intact.
         self.n_nodes = new_n
         if self.layout == 'deep_grid':
-            # Each grown cell starts a new cortical layer.
+            # The grown cells form a new deepest layer (possibly partial).
+            self.layer_shapes = self.layer_shapes + [self.layer_shapes[-1]]
+            self.layer_ranges = self.layer_ranges + [(old_n, new_n)]
             self.n_layers += 1
-            new_layer = torch.tensor(
-                [[l * self.per_layer + i for i in range(self.per_layer)]
-                 for l in range(self.n_layers)], dtype=torch.long,
-                device=self.layer_index.device)
-            self.layer_index = new_layer
+            self.layer_index = self._layer_index_table().to(self.layer_index.device)
         else:
             self.dim_z = max(self.dim_z, max(p[2] for p in extra) + 1)
 
@@ -1107,8 +1184,51 @@ class Raslila(nn.Module):
             torch.where(self.adjacency[:, i])[0].tolist() for i in range(self.n_nodes)
         ]
 
+    def _edge_messages(self, nets, src_feats, tgt_feat):
+        """Run K edge networks at once: [K,B,T,D] sources -> [K,B,T,D] messages.
+
+        Mathematically identical to calling each EdgeNetwork in turn, but the
+        K small MLPs become one batched matmul per layer. The per-edge Python
+        loop issued ~5 tiny kernels per edge (1,236 edges per forward at
+        depth_sweeps=2), which left the GPU idle waiting on launches. Weights
+        are stacked from the existing modules on every call, so parameters,
+        state_dict keys and checkpoints are unchanged.
+        """
+        K, B, T, D = src_feats.shape
+        h = torch.cat([src_feats, tgt_feat.unsqueeze(0).expand(K, -1, -1, -1)], dim=-1)
+        h = h.reshape(K, B * T, 2 * D)
+        for li, layer in enumerate(nets[0].net):
+            if isinstance(layer, nn.Linear):
+                w = torch.stack([n.net[li].weight for n in nets], dim=0)   # [K,out,in]
+                b = torch.stack([n.net[li].bias for n in nets], dim=0)     # [K,out]
+                h = torch.baddbmm(b.unsqueeze(1).to(h.dtype), h, w.transpose(1, 2).to(h.dtype))
+            elif isinstance(layer, nn.GELU):
+                h = F.gelu(h)
+            elif isinstance(layer, nn.Dropout):
+                h = F.dropout(h, layer.p, self.training)
+            else:
+                raise TypeError('unsupported edge layer {}'.format(type(layer).__name__))
+        return h.reshape(K, B, T, -1)
+
+    def _settled(self, logits, prev_p):
+        """Has the next-token prediction settled? Returns (settled, probs).
+
+        Settled = every sequence in the batch is already confident
+        (max prob >= halt_confidence) OR its prediction moved less than
+        halt_tol (total variation) since the previous cycle. Only the last
+        position matters at inference: that is the token being produced.
+        """
+        p = torch.softmax(logits[:, -1].float(), dim=-1)
+        if float(p.max(dim=-1).values.min()) >= float(self.config.halt_confidence):
+            return True, p
+        if prev_p is not None:
+            moved = 0.5 * (p - prev_p).abs().sum(dim=-1)
+            if float(moved.max()) < float(self.config.halt_tol):
+                return True, p
+        return False, p
+
     def forward(self, input_ids, return_activations=False, return_entanglement=False,
-                keep_state=False):
+                keep_state=False, think_cycles=None, halt=None):
         """
         Forward pass through the Raslila network.
 
@@ -1178,44 +1298,17 @@ class Raslila(nn.Module):
         # Which blocks participate in the readout. 'last' = only the deepest
         # layer (like a deep net's output stage); 'all' = every block.
         if self.layout == 'deep_grid' and getattr(self.config, 'readout_layer', 'last') == 'last':
-            readout_ids = list(range((self.n_layers - 1) * self.per_layer,
-                                     self.n_layers * self.per_layer))
+            readout_ids = self.layer_ids(self.n_layers - 1)
         else:
             readout_ids = list(range(self.n_nodes))
 
-        # BIDIRECTIONAL DEPTH SWEEPS. The cortex is not a feedforward stack: a
-        # hypothesis propagates up and the higher layers send it back down. A
-        # single bottom-up pass cannot do that -- the lower layer is written
-        # before the upper one exists to talk back -- so `depth_sweeps` alternates
-        # the traversal direction, which is what finally uses the feedback edges.
-        n_sweeps = max(1, int(self.config.depth_sweeps))
-        for sweep in range(n_sweeps):
-            # Order matters for correctness, not just cost. The readout takes the
-            # DEEPEST layer, so the final sweep must end at that layer --
-            # otherwise the readout reads a state that was written before the
-            # feedback refinement reached the layers below it, and the whole
-            # point of the downward sweep is thrown away.
-            # The readout takes the DEEPEST layer, so the FINAL sweep must run
-            # upward and finish there. Picking a fixed starting polarity and
-            # alternating does not guarantee that: with `sweep % 2 == 1` the
-            # sequence for 2 sweeps was [down, up] (accidentally correct) but
-            # for 1 sweep it was [down] -- the readout layer was computed FIRST,
-            # and every lower layer was then computed and thrown away, because
-            # readout_layer='last' reads only the deepest sheet. Measured: with
-            # depth_sweeps=1, zeroing the transformer weights of every block
-            # outside the readout layer changed the logits by exactly 0.0. The
-            # lower 4/5 of the model was dead computation and received no
-            # gradient at all.
-            #
-            # Choose the starting polarity so that alternation ENDS on an
-            # upward sweep for any sweep count, keeping the feedback traversal
-            # and the readout-ordering requirement consistent.
-            ascending = (sweep % 2) == ((n_sweeps - 1) % 2)
+        def run_sweep(ascending):
+            """One pass over every layer, bottom-up or top-down."""
+            nonlocal node_states, prev_mag
             layer_order = (range(self.n_layers) if ascending
                            else reversed(range(self.n_layers)))
             for layer in layer_order:
-                layer_ids = (list(range(layer * self.per_layer,
-                                        (layer + 1) * self.per_layer))
+                layer_ids = (self.layer_ids(layer)
                              if self.layout == 'deep_grid'
                              else list(range(self.n_nodes)))
 
@@ -1262,31 +1355,27 @@ class Raslila(nn.Module):
                                     node_out, self.persistent_state[node_idx])
                                 node_out = node_out + mem
 
-                            exc_list = []
-                            inh_list = []
+                            srcs, nets = [], []
                             for src_t in self.in_edges[node_idx]:
                                 edge_key = "{}_{}".format(src_t, node_idx)
-                                if edge_key not in self.edge_networks:
-                                    continue
-                                src_feat = src[src_t]
-                                if signed:
-                                    e, i_ = self.edge_networks[edge_key].signed(
-                                        src_feat, src[node_idx])
-                                    # alpha/beta interference applies to the
-                                    # excitatory part; the inhibitory part is pure.
-                                    e = self.alpha * src_feat + self.beta * src[node_idx] + e
-                                    exc_list.append(e)
-                                    inh_list.append(i_ * self.inhibit_beta)
-                                else:
-                                    msg = self.edge_networks[edge_key](src_feat, src[node_idx])
-                                    msg = self.alpha * src_feat + self.beta * src[node_idx] + msg
-                                    exc_list.append(msg)
+                                if edge_key in self.edge_networks:
+                                    srcs.append(src[src_t])
+                                    nets.append(self.edge_networks[edge_key])
 
-                            if exc_list:
-                                aggregated = torch.stack(exc_list, dim=0).mean(dim=0)
-                                if signed and inh_list:
-                                    aggregated = aggregated - torch.stack(
-                                        inh_list, dim=0).mean(dim=0)
+                            if nets:
+                                src_feats = torch.stack(srcs, dim=0)      # [K,B,T,D]
+                                tgt_feat = src[node_idx]
+                                out = self._edge_messages(nets, src_feats, tgt_feat)
+                                # alpha/beta interference, averaged over the K
+                                # incoming edges: mean(a*s_k + b*t + m_k).
+                                base = self.alpha * src_feats.mean(0) + self.beta * tgt_feat
+                                if signed:
+                                    # Excitatory part carries the interference;
+                                    # the inhibitory part is pure.
+                                    aggregated = (base + F.relu(out).mean(0)
+                                                  - (-F.relu(-out) * self.inhibit_beta).mean(0))
+                                else:
+                                    aggregated = base + out.mean(0)
                                 mag[node_idx] = aggregated.detach().abs().mean()
                                 if self.config.gated_messages:
                                     g = torch.sigmoid(self.msg_gate(node_out))
@@ -1320,39 +1409,108 @@ class Raslila(nn.Module):
                 if return_activations:
                     node_activations.append(node_states.clone())
 
-        # Readout operates on the selected blocks only.
-        readout_states = node_states[:, :, readout_ids, :]
-        n_read = len(readout_ids)
+        def readout(node_states):
+            """Deepest sheet -> (logits, final_repr)."""
+            # Readout operates on the selected blocks only.
+            readout_states = node_states[:, :, readout_ids, :]
+            n_read = len(readout_ids)
 
-        # Learned readout: weight each block region's contribution per token.
-        node_weights = torch.softmax(self.node_readout(readout_states).squeeze(-1), dim=2)
-        if self.config.readout_topk > 0:
-            k = min(self.config.readout_topk, n_read)
-            topv, topi = torch.topk(node_weights, k, dim=2)
-            sparse = torch.zeros_like(node_weights).scatter_(2, topi, topv)
-            node_weights = sparse / sparse.sum(dim=2, keepdim=True).clamp_min(1e-8)
-        summary = (readout_states * node_weights.unsqueeze(-1)).sum(dim=2)
+            # Learned readout: weight each block region's contribution per token.
+            node_weights = torch.softmax(self.node_readout(readout_states).squeeze(-1), dim=2)
+            if self.config.readout_topk > 0:
+                k = min(self.config.readout_topk, n_read)
+                topv, topi = torch.topk(node_weights, k, dim=2)
+                sparse = torch.zeros_like(node_weights).scatter_(2, topi, topv)
+                node_weights = sparse / sparse.sum(dim=2, keepdim=True).clamp_min(1e-8)
+            summary = (readout_states * node_weights.unsqueeze(-1)).sum(dim=2)
 
-        # Binding readout: if enabled, compose the region set into emergent
-        # composites and read from THAT set, instead of collapsing to a mean.
-        bound, _ = self.binder(readout_states, self.adjacency[readout_ids][:, readout_ids])
-        if bound is not None:
-            # A query derived from the region summary attends over the bound
-            # composites: the prediction can depend on specific pairings
-            # ("A bound to role-k") rather than a linear blend of regions.
-            q = self.bind_query(summary).unsqueeze(2)          # [B,T,1,D]
-            k = self.bind_key(bound)                             # [B,T,M,D]
-            v = self.bind_value(bound)                           # [B,T,M,D]
-            y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
-            blended = self.bind_out(y.squeeze(2)) + summary      # residual: never
-            # lose the plain path, so binding can only add signal.
-            final_repr = blended
+            # Binding readout: if enabled, compose the region set into emergent
+            # composites and read from THAT set, instead of collapsing to a mean.
+            bound, _ = self.binder(readout_states, self.adjacency[readout_ids][:, readout_ids])
+            if bound is not None:
+                # A query derived from the region summary attends over the bound
+                # composites: the prediction can depend on specific pairings
+                # ("A bound to role-k") rather than a linear blend of regions.
+                q = self.bind_query(summary).unsqueeze(2)          # [B,T,1,D]
+                k = self.bind_key(bound)                             # [B,T,M,D]
+                v = self.bind_value(bound)                           # [B,T,M,D]
+                y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+                blended = self.bind_out(y.squeeze(2)) + summary      # residual: never
+                # lose the plain path, so binding can only add signal.
+                final_repr = blended
+            else:
+                final_repr = summary
+            final_repr = self.final_norm(final_repr)
+            logits = self.output_proj(final_repr)
+            return logits, final_repr
+
+        # BIDIRECTIONAL DEPTH SWEEPS. The cortex is not a feedforward stack: a
+        # hypothesis propagates up and the higher layers send it back down. A
+        # single bottom-up pass cannot do that -- the lower layer is written
+        # before the upper one exists to talk back -- so `depth_sweeps` alternates
+        # the traversal direction, which is what finally uses the feedback edges.
+        n_cycles = int(self.config.max_think_cycles if think_cycles is None
+                       else think_cycles)
+        exit_logits = []
+        cycles_used = None
+        if n_cycles <= 0:
+            # Fixed depth (the default): exactly `depth_sweeps` alternating passes.
+            n_sweeps = max(1, int(self.config.depth_sweeps))
+            for sweep in range(n_sweeps):
+                # Order matters for correctness, not just cost. The readout takes the
+                # DEEPEST layer, so the final sweep must end at that layer --
+                # otherwise the readout reads a state that was written before the
+                # feedback refinement reached the layers below it, and the whole
+                # point of the downward sweep is thrown away.
+                # The readout takes the DEEPEST layer, so the FINAL sweep must run
+                # upward and finish there. Picking a fixed starting polarity and
+                # alternating does not guarantee that: with `sweep % 2 == 1` the
+                # sequence for 2 sweeps was [down, up] (accidentally correct) but
+                # for 1 sweep it was [down] -- the readout layer was computed FIRST,
+                # and every lower layer was then computed and thrown away, because
+                # readout_layer='last' reads only the deepest sheet. Measured: with
+                # depth_sweeps=1, zeroing the transformer weights of every block
+                # outside the readout layer changed the logits by exactly 0.0. The
+                # lower 4/5 of the model was dead computation and received no
+                # gradient at all.
+                #
+                # Choose the starting polarity so that alternation ENDS on an
+                # upward sweep for any sweep count, keeping the feedback traversal
+                # and the readout-ordering requirement consistent.
+                ascending = (sweep % 2) == ((n_sweeps - 1) % 2)
+                run_sweep(ascending)
+            logits, final_repr = readout(node_states)
         else:
-            final_repr = summary
-        final_repr = self.final_norm(final_repr)
-        logits = self.output_proj(final_repr)
+            # ADAPTIVE DEPTH ("think until settled"). Cycle 1 is one bottom-up
+            # pass. Every further cycle sends the hypothesis back down through
+            # the feedback edges and up again, then reads out. Each cycle ends
+            # on the deepest sheet, so every readout is a complete answer --
+            # which is what lets an easy input leave after cycle 1 while a hard
+            # one keeps looping through the grid.
+            if halt is None:
+                halt = bool(self.config.halt_at_inference) and not self.training
+            run_sweep(True)
+            logits, final_repr = readout(node_states)
+            exit_logits.append(logits)
+            cycles_used = 1
+            prev_p = None
+            for cycle in range(2, n_cycles + 1):
+                if halt:
+                    settled, prev_p = self._settled(logits, prev_p)
+                    if settled:
+                        break
+                run_sweep(False)
+                run_sweep(True)
+                logits, final_repr = readout(node_states)
+                exit_logits.append(logits)
+                cycles_used = cycle
 
         result = {'logits': logits, 'final_repr': final_repr}
+        if exit_logits:
+            # One prediction per thinking cycle (deep supervision trains all
+            # of them) and how many cycles this input actually used.
+            result['exit_logits'] = exit_logits
+            result['cycles_used'] = cycles_used
 
         # Legacy 8-token display fields ('token'/'confidence') are computed ONLY
         # for the string-prompt demo path. Evaluating them on every tensor

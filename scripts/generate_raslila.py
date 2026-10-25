@@ -104,6 +104,10 @@ def main():
         print('Warning: window {} exceeds max_seq_len {}; clamped to {}.'.format(
             requested, arch_max, window))
 
+    # Tokenizers fitted with document separators end each document with
+    # <|endoftext|>; stop there instead of rambling into an unrelated document.
+    eos_id = bpe.token_to_id('<|endoftext|>') if bpe is not None else None
+
     with torch.no_grad():
         for _ in range(args.tokens):
             out = model(input_ids[:, -window:])
@@ -114,6 +118,8 @@ def main():
             mask[1:] = last[1:]
             probs = F.softmax(mask / args.temperature, dim=-1)
             nxt = torch.multinomial(probs, 1).squeeze(0)
+            if eos_id is not None and int(nxt) == eos_id:
+                break
             input_ids = torch.cat([input_ids, nxt.unsqueeze(0).unsqueeze(0)], dim=1)
 
     gen = decode(input_ids[0, len(ids):].tolist())

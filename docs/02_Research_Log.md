@@ -533,3 +533,121 @@ casts to `int64` before indexing, so nothing downstream sees the dtype.
 and whether 200k vocab beats 16k on loss. Both are priors. The vocab one is a
 stronger prior (every production model uses a large subword vocab), but it is
 still a prior until a paired run says otherwise.
+
+## 2026-10 (3) - 200k vocab reverted, FineWeb-Edu, training-recipe fixes
+
+**Correction to entry (2).** The 199,995-token vocabulary never actually
+reached the active configs: every config, `meta.json` and the committed
+tokenizer stayed at 16,384, while README and docs described 200k. The
+`config.yaml` A/B pair also kept the original 618-edge wiring on purpose (see
+[08](08_Runbook_Bidirectional_Test.md)), but `check_configs.py` demanded
+brain-like wiring for every config and so failed. Resolution: **16,384 stays.**
+At hidden 256 a 200k vocab is ~47M embedding parameters and a 200k-way softmax on
+every token, and that budget is better spent on the grid. `check_configs.py` now
+holds the A/B pair to `false / 0.1 / 3` and the 50M/20B configs to
+`true / 0.3 / 8`. Measured sizes: `config.yaml` **163,605,123**,
+`config_50m.yaml` **68,903,971**.
+
+**1. Corpus: openwebtext -> FineWeb-Edu (`sample-10BT`).** This changes data
+quality, not quantity. openwebtext has no quality filter; FineWeb-Edu is
+classifier-filtered for educational value and deduplicated (arXiv 2406.17557).
+The pipeline also gained:
+- **document separators**: `<|endoftext|>` (id 1) after every document. Before
+  this, documents were concatenated with nothing between them, so the model
+  could not learn where one ends;
+- whitespace normalisation, plus `min_chars`, `min_alpha_frac` and exact-dedup
+  filters. These dropped **0 of 3,072** FineWeb-Edu documents in a test build,
+  so they are a safety net for rawer corpora, not a measured improvement here;
+- a shuffled stream (`shuffle_seed` existed but was never used), so the held-out
+  head is a random sample;
+- a `<cache>.json` sidecar that forces a rebuild if the tokenizer changes;
+- `encode_batch` instead of per-document `encode` (multi-core);
+- tokenizer recipe `v2-eos-nfc` (NFC normalisation, EOS special token), with
+  ~4.3 chars/token measured on a 20M-char test fit.
+
+**2. Training recipe.**
+- **cosine** LR decay to `min_lr` (`lr_schedule: cosine`) is the default in all
+  configs. The 50M/20B configs had been running at constant LR after warmup;
+- AdamW betas (0.9, 0.95), fused on CUDA, TF32 enabled;
+- weight decay only on 2-D weights. It had been applied to every parameter,
+  including RMSNorm gains and the alpha/beta scalars;
+- `val_tokens: 2,000,000` held out, evaluated over 128 windows (was 16, off by
+  default);
+- **bug:** `--steps` on resume ran that many *extra* steps, while the runbook
+  documented it as the total target. It is now the total, as documented;
+- **bug:** `--fsdp` raised `UnboundLocalError` (`use_bf16` was read before it
+  was assigned).
+
+**3. Batched edge networks.** `Raslila._edge_messages` stacks the K incoming
+edge MLPs of a block and runs each layer as one `baddbmm`. Checked against the
+committed per-edge loop with identical weights: logits differ by at most
+2.4e-7 and gradients by at most 1.5e-9, with and without `inhibit`. Parameters
+and state_dict keys are unchanged. CPU speed-up measured at 10-20%; the GPU
+speed-up is expected to be larger (the loop was launch-bound) but is **not
+measured**.
+
+**Checked and left alone:** activation growth across the 10 layer-visits per
+forward pass at init is mild (RMS 0.04 -> 0.36 -> 0.78), so the self-term in
+`alpha*src + beta*tgt` double-counting the residual is not causing blow-up.
+
+**Not measured yet:** any loss effect of these changes. All earlier loss numbers
+use other data and tokenizers and are not comparable. Both A/B arms received
+identical changes and still differ by `depth_sweeps` alone.
+
+## 2026-10 (4) - adaptive depth and an always-on session
+
+**Adaptive depth ("think until settled").** New `RaslilaConfig` fields
+`max_think_cycles`, `halt_at_inference`, `halt_confidence`, `halt_tol`. Cycle 1
+is one bottom-up pass; each further cycle is down + up; a readout follows every
+cycle, so every cycle ends on the deepest sheet and is a complete answer. The
+inference halt rule: stop when the next-token prediction is confident or has
+stopped moving. Training uses deep supervision (mean CE over all exits) at a
+random depth 1..N. `forward` was refactored into `run_sweep` / `readout`
+closures; with `max_think_cycles: 0` the logits are **bit-identical** (max
+difference 0.0) to the previous code at depth_sweeps 1, 2 and 3. Every parameter
+receives a gradient at any sampled depth, so DDP is safe. On an untrained toy
+model the halt rule behaves as designed: 1 cycle when everything is "easy"
+(`halt_confidence: 0`), the full cap when nothing settles, 2 when predictions
+stop changing. `config_adaptive.yaml` is `config.yaml` plus `max_think_cycles: 4`
+(same 163,605,123 params, ~2x training compute). It is a separate experiment,
+not part of the depth_sweeps A/B.
+
+**Always-on live session** (`scripts/raslila_live.py`). A worker thread owns the
+model and the conversation; the main thread only reads input. Input is drained
+between every generated token, so text typed mid-answer is added to the context
+and generation continues, with no restart. Idle = blocked on a queue (zero
+compute); after `--idle-sleep` it frees the GPU cache and, with `--offload`, moves
+weights to CPU, then wakes on the next input with the conversation intact. An
+`--inbox` directory is polled every second for `.txt` files. A scripted session
+tested mid-answer injection, inbox pickup, resting, waking and `/status`.
+
+**Not measured yet:** whether adaptive depth beats fixed `depth_sweeps: 2` on
+loss per unit of compute, and what fraction of tokens exit early on a trained
+model. The halt thresholds (0.9 / 0.02) are starting values, not tuned. There is
+no KV cache, so the live session re-runs the whole window for each token.
+
+## 2026-10 (5) - any grid shape
+
+`RaslilaConfig.layer_shapes` (list of `[rows, cols]`, shallow to deep) lets
+layers differ in size; `None` keeps the uniform box. The model now stores
+`layer_shapes` / `layer_ranges` instead of assuming `layer * per_layer`
+indexing everywhere: positions, lateral and diagonal wiring, vertical and
+feedback wiring, `dense_layers`, readout (deepest sheet), the per-layer sweep
+and growth. Unequal sheets are wired by relative position in both directions.
+Checks: for uniform boxes (5×5×5, 3×4×7, 2×1×6, 4×3×3, with and without
+diagonal/long-range) the adjacency, state_dict keys and logits are identical to
+the previous code (difference 0.0). Pyramid, widening funnel, hourglass, strip,
+dense-layer and adaptive-depth shapes all train with every parameter getting a
+gradient and no isolated block; growth on a ragged grid appends a layer with
+the deepest sheet's shape; a pyramid checkpoint reloads in `raslila_live.py`.
+
+Known edge case: a single-block grid (`[[1, 1]]`) has no edges, so `alpha` and
+`beta` get no gradient. That is harmless on one GPU but trips DDP's
+unused-parameter check. The trainer's 20B memory guard applies only to the
+uniform 5×5×5 shape.
+
+`grid_shape: [layers, rows, cols]` added as the one-line form of
+depth_layers/grid_h/grid_w (resolved in `RaslilaConfig.__post_init__`; mutually
+exclusive with `layer_shapes`). All configs now use it; parameter counts are
+unchanged (163,605,123 / 68,903,971). Checked at [7,3,10], [2,9,4], [1,1,12],
+[10,2,2] and [3,6,1], with every parameter receiving a gradient.

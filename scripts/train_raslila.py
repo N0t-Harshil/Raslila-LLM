@@ -18,6 +18,7 @@ import os
 import time
 import random
 import hashlib
+import math
 import argparse
 import csv
 import dataclasses
@@ -367,7 +368,8 @@ def main():
             'Config mismatch: tok_mode="bpe" needs a BPE-sized vocab but '
             'raslila.vocab_size={}. Train a tokenizer and set vocab_size to its '
             'size.'.format(model_cfg.vocab_size))
-    twenty_b_family = (model_cfg.hidden_dim == 1024
+    # The verified 20B memory budget is for the uniform 5x5x5 shape only.
+    twenty_b_family = (model_cfg.hidden_dim == 1024 and not model_cfg.layer_shapes
                        and model_cfg.depth_layers * model_cfg.grid_h * model_cfg.grid_w == 125)
     if twenty_b_family and model_cfg.node_depth > 11:
         raise SystemExit('The 4x A100-80GB configuration supports node_depth <= 11; the requested shape exceeds the verified memory budget.')
@@ -386,6 +388,17 @@ def main():
             raise SystemExit('FSDP CPU initialization needs about {:.1f} GB available host memory (model replicas plus token cache and 10% reserve); only {:.1f} GB is available.'.format(host_required / 1e9, host_available / 1e9))
         if is_main and host_available is not None:
             print('FSDP CPU staging: estimated {:.1f} GB host memory required; {:.1f} GB available.'.format(host_required / 1e9, host_available / 1e9))
+    # Precision flags are needed by the FSDP MixedPrecision policy below, so they
+    # must be decided before wrapping (they used to be set after, which made
+    # --fsdp raise UnboundLocalError on `use_bf16`).
+    scaler = torch.amp.GradScaler('cuda') if (torch.cuda.is_available() and
+                                             mixed_precision in ('fp16',)) else None
+    use_bf16 = torch.cuda.is_available() and mixed_precision in ('bf16', 'true')
+    if torch.cuda.is_available():
+        # TF32 matmuls on Ampere (A100): large speedup for the fp32 parts.
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
     model = Raslila(model_cfg) if fsdp_cpu_init else Raslila(model_cfg).to(device)
     n_params = sum(p.numel() for p in model.parameters())
     if is_main:
@@ -394,9 +407,10 @@ def main():
         print('Device: {}'.format(device))
         print('Steps: {}, batch: {}, seq_len: {}, lr: {}, accum: {}'.format(
             steps, batch_size, seq_len, lr, accum))
-        print('Grid: {}x{}x{}, hidden={}'.format(
-            b3.get('dim_x'), b3.get('dim_y'), b3.get('dim_z'),
-            b3.get('hidden_dim')))
+        m0 = model.module if hasattr(model, 'module') else model
+        print('Grid: {} layers, sheets {} (rows x cols, shallow -> deep), {} edges, hidden={}'.format(
+            m0.n_layers, ' -> '.join('{}x{}'.format(h, w) for h, w in m0.layer_shapes),
+            int(m0.adjacency.sum()), model_cfg.hidden_dim))
 
     if use_dist and args.fsdp:
         from torch.distributed.fsdp import (
@@ -440,8 +454,15 @@ def main():
     params = list(model.parameters())
     # Under FSDP, optimizer-state sharding is handled by FSDP itself (it exposes
     # sharded flat params; AdamW over those is the standard recipe).
+    # Decay only weight matrices. Decaying norm gains, biases and the alpha/beta
+    # interference scalars pulls them toward 0, which is a regulariser nobody
+    # asked for (GPT-2/LLaMA recipe). The tied embedding is 2D and is decayed.
+    decay = [p for p in params if p.dim() >= 2]
+    no_decay = [p for p in params if p.dim() < 2]
     optimizer = torch.optim.AdamW(
-        params, lr=lr, weight_decay=float(tr.get('weight_decay', 0.01)))
+        [{'params': decay, 'weight_decay': float(tr.get('weight_decay', 0.01))},
+         {'params': no_decay, 'weight_decay': 0.0}],
+        lr=lr, betas=(0.9, 0.95), fused=torch.cuda.is_available() and not args.fsdp)
     warmup = max(1, int(tr.get('warmup_steps', 200)))
     if args.warmup is not None:
         warmup = args.warmup
@@ -458,6 +479,12 @@ def main():
     # 6e-4 -> 4.7e-6, and the last quarter of training runs frozen. `min_lr` is
     # documented in config.yaml but was never read by this path.
     min_lr = float(tr.get('min_lr', 0.0) or 0.0)
+    # 'plateau' = warmup then loss-adaptive halving (adaptive_lr); 'cosine' =
+    # warmup then cosine decay to min_lr over this run's steps. Cosine is the
+    # standard for a fixed step budget and does not react to loss noise.
+    lr_schedule = str(tr.get('lr_schedule', 'plateau'))
+    if lr_schedule not in ('plateau', 'cosine'):
+        raise SystemExit('training.lr_schedule must be plateau or cosine, got {!r}'.format(lr_schedule))
     best_loss = float('inf')
     plateau_streak = 0
 
@@ -468,11 +495,19 @@ def main():
         for g in optimizer.param_groups:
             g['lr'] = float(new_lr)
 
+    def cosine_lr(step_idx):
+        horizon = max(1, steps - warmup)
+        progress = min(1.0, max(0.0, (step_idx - warmup) / horizon))
+        return min_lr + 0.5 * (lr - min_lr) * (1.0 + math.cos(math.pi * progress))
+
     def adjust_lr(step_idx, win_avg):
         """Warmup ramp then plateau-aware decay based on the loss."""
         nonlocal best_loss, plateau_streak
         if step_idx < warmup:
             set_lr(lr * min(1.0, (step_idx + 1) / warmup))
+            return
+        if lr_schedule == 'cosine':
+            set_lr(cosine_lr(step_idx))
             return
         if not adaptive_lr:
             set_lr(lr)
@@ -486,17 +521,20 @@ def main():
             set_lr(max(cur_lr() * lr_factor, min_lr))
             plateau_streak = 0
 
-    scaler = torch.amp.GradScaler('cuda') if (torch.cuda.is_available() and
-                                             mixed_precision in ('fp16',)) else None
-    use_bf16 = torch.cuda.is_available() and mixed_precision in ('bf16', 'true')
-
     # Resume from checkpoint if requested
     start_step = 0
     if args.resume:
         ckpt = torch.load(args.resume, map_location=device)
         model.load_state_dict(ckpt['model'])
         if ckpt.get('optimizer') is not None:
-            optimizer.load_state_dict(ckpt['optimizer'])
+            try:
+                optimizer.load_state_dict(ckpt['optimizer'])
+            except ValueError as exc:
+                # Checkpoints from before the decay/no-decay split have one
+                # param group; the weights still load, the moments restart.
+                if is_main:
+                    print('WARNING: optimizer state not restored ({}); '
+                          'continuing with fresh AdamW moments.'.format(exc))
         if ckpt.get('lr') is not None:
             set_lr(ckpt['lr'])
         best_loss = float(ckpt.get('best_loss', best_loss))
@@ -505,6 +543,12 @@ def main():
         if is_main:
             print('Resumed from {} at step {} (lr {:.2e})'.format(
                 args.resume, start_step - 1, cur_lr()))
+        # --steps is the TOTAL target, so resuming a 20000-step run at step
+        # 17999 runs the remaining 2000 (it used to run 20000 more).
+        if start_step >= steps:
+            raise SystemExit('Checkpoint is already at step {}; --steps {} is the total '
+                             'target, so there is nothing left to train.'.format(
+                                 start_step - 1, steps))
 
     # Real-text corpus: byte-level (default) or BPE (3-4x token efficiency).
     vocab = model_cfg.vocab_size
@@ -592,7 +636,7 @@ def main():
         total = 0.0
         count = 0
         starts = np.linspace(0, max(0, len(val_corpus) - seq_len - 1),
-                             num=min(16, max(1, len(val_corpus) // max(1, seq_len))),
+                             num=min(128, max(1, len(val_corpus) // max(1, seq_len))),
                              dtype=np.int64)
         with torch.no_grad():
             for offset in range(0, len(starts), batch_size):
@@ -604,13 +648,17 @@ def main():
                 x = torch.from_numpy(val_corpus[ix].astype(np.int64)).to(device)
                 y = torch.from_numpy(val_corpus[ix + 1].astype(np.int64)).to(device)
                 with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-                    logits = model(x)['logits']
+                    logits = model(x, halt=False)['logits']  # full depth, comparable across evals
                     total += F.cross_entropy(logits.reshape(-1, logits.size(-1)),
                                              y.reshape(-1), ignore_index=0).item()
                 count += 1
         if was_training:
             model.train()
         return total / max(1, count)
+
+    max_think = int(getattr(model_cfg, 'max_think_cycles', 0) or 0)
+    if is_main and max_think > 0:
+        print('Adaptive depth: 1..{} thinking cycles per step, all exits supervised'.format(max_think))
 
     grow_every = int(getattr(model_cfg, 'grow_every', 0) or 0)
     grow_min_scale = float(getattr(model_cfg, 'grow_min_scale', 0.004) or 0.004)
@@ -629,7 +677,7 @@ def main():
     replay_seen = 0.0     # fraction of the corpus already consumed
     replay_stats = {'hits': 0, 'steps': 0}
 
-    for step in range(start_step, start_step + steps):
+    for step in range(start_step, steps):
         gstep = step + 1  # 1-indexed global step for warmup math
         # Experience replay: draw from EARLIER in the corpus rather than only
         # from fresh text, so knowledge gets revisited instead of overwritten.
@@ -667,13 +715,20 @@ def main():
 
         model.train()
         with torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-            out = model(input_ids)
+            if max_think > 0:
+                # Adaptive depth: train at a random depth each step and score
+                # EVERY cycle's readout, so exiting after any cycle gives a real
+                # answer and later cycles learn to refine earlier ones.
+                out = model(input_ids, think_cycles=random.randint(1, max_think))
+            else:
+                out = model(input_ids)
             logits = out['logits']
-            loss = F.cross_entropy(
-                logits.view(-1, logits.size(-1)),
-                target_ids.view(-1),
+            exits = out.get('exit_logits') or [logits]
+            loss = torch.stack([F.cross_entropy(
+                ex.reshape(-1, ex.size(-1)),
+                target_ids.reshape(-1),
                 ignore_index=0,
-            )
+            ) for ex in exits]).mean()
             # MTP auxiliary loss (hierarchical forecasting): predict t+2..t+K
             # from the final representation. Mirrors full_train_step so the
             # mtp_steps/mtp_weight config actually takes effect in training.
@@ -704,11 +759,13 @@ def main():
         else:
             loss.backward()
 
-        last_step = (gstep == start_step + steps)
+        last_step = (gstep == steps)
         if gstep % accum == 0 or last_step:
             # Warmup ramp applies at every optimizer step; plateau decay every window
             if step < warmup:
                 set_lr(lr * min(1.0, gstep / warmup))
+            elif lr_schedule == 'cosine':
+                set_lr(cosine_lr(step))
             if scaler is not None:
                 scaler.unscale_(optimizer)
             # FSDP shards gradients, so each rank holds only its slice and a

@@ -116,6 +116,27 @@ tokens → token_embedding → input_proj → 125 block states (5 layers × 5×5
                             final_norm → output head (tied) → logits
 ```
 
+**Any shape.** `layer_shapes: [[rows, cols], ...]` (shallow to deep) replaces
+the uniform `depth_layers × grid_h × grid_w` box, so sheets can differ in size.
+The model keeps `layer_shapes` and `layer_ranges` (contiguous block ids per
+layer), and every grid walk goes through them. Vertical links between unequal
+sheets use `_map_cell` (centre-to-centre scaling) in both directions, so no
+block is left without a vertical link. For a uniform box both maps are the
+identity, and the result is verified bit-identical to the old code at
+5×5×5, 3×4×7, 2×1×6 and 4×3×3. `layer_index` is padded with -1 when layers
+differ in size.
+
+**Adaptive depth** (`max_think_cycles > 0`, see `config_adaptive.yaml`). The
+box above becomes a loop: cycle 1 runs layer 1 → 5; each further cycle runs
+layer 5 → 1 (feedback) then 1 → 5, and the readout runs after every cycle. At
+inference `Raslila._settled` stops the loop when the last position's
+next-token distribution is confident (max prob ≥ `halt_confidence`) or moved
+less than `halt_tol` (total variation) since the previous cycle. `forward`
+returns `exit_logits` (one per cycle) and `cycles_used`; the trainer averages
+cross-entropy over every exit at a random depth 1..N per step. With
+`max_think_cycles: 0` the fixed `depth_sweeps` path runs and is bit-identical to
+the pre-refactor code (checked at 1, 2 and 3 sweeps).
+
 ## Layer by layer, with justification
 
 | Layer | Choice | Why (evidence) |
@@ -126,12 +147,12 @@ tokens → token_embedding → input_proj → 125 block states (5 layers × 5×5
 | FFN | **SwiGLU** (gated SiLU) | Consistently beats parameter-matched GELU. Width auto-scaled ~2/3 for param parity |
 | Regions | **5 sequential layers × 5×5 2D sheets = 125 blocks**, distinct weights per layer | A conventional LLM is the degenerate 1D case (one flat chain). Raslila restores the 2D sheet per layer and stacks sheets — cortex-like |
 | Node identity | Learnable role embedding from (col, row, layer) position | Breaks block symmetry so regions specialize. Zero-init so early activations stay balanced |
-| Edges | `EdgeNetwork` MLP per connection (618 at 5×(5×5)), plus learned α/β interference | The original "edges as first-class citizens" idea; the single thing a 1D transformer cannot do |
+| Edges | `EdgeNetwork` MLP per connection (618 at 5×(5×5) in `config.yaml`), plus learned α/β interference. All incoming edges of a block run as one batched matmul (`Raslila._edge_messages`), numerically identical to calling them one by one | The original "edges as first-class citizens" idea; the single thing a 1D transformer cannot do |
 | Recurrence | Immediate (Gauss-Seidel) cascades **within** each sheet, plus **inter-layer feedback** | A block reads neighbours' *fresh* states; and L+1 feeds back to L because the cortex is not a feedforward stack. Measured −0.026 nats in the flat-lattice A/B |
 | Binding | Multiplicative bind of the readout blocks to learned roles, read as a **set** | The binding problem fix. A weighted mean is *linear* in the block set, so no composite can emerge. Measured −0.041 nats — the largest single gain |
 | Readout | Learned attention over the **last layer's** blocks | Deep-net semantics: the deepest sheet produces the output |
 | Output | `output_proj` tied to `token_embedding` | Standard; requires GPT-2-style 0.02 init or the softmax saturates (init loss ~45) |
-| Vocabulary | **BPE 199,995** (id 0 = `<pad>`), byte-level 257 optional | BPE is 5.43 chars/token vs bytes' 1.0 — a 5.4× cut in steps-per-epoch. See [04](04_Training_and_Data.md) |
+| Vocabulary | **BPE 16,384** (id 0 = `<|pad|>`, id 1 = `<|endoftext|>`), byte-level 257 optional | BPE is ~4.3 chars/token on FineWeb-Edu vs bytes' 1.0. A 200k vocab was trialled and not adopted (47M embedding params at hidden 256). See [04](04_Training_and_Data.md) |
 
 ## Growth (cortical growth, optional)
 

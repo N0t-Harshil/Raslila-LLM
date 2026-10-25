@@ -1,21 +1,23 @@
 # Raslila Pre-Training Design Document
 
-> **Historical document (2026-09) — read with care.** Two changes landed in
-> 2026-10: the training corpus moved to HuggingFace `Skylion007/openwebtext`
-> (1.5B tokens, auto-fetched), and the wiring went brain-like
-> (`diagonal: true`, `long_range_prob: 0.3`, `max_long_range: 8` — 618 → 1,114
-> edges at 5×5×5, 163.6M → 212.6M params at hidden 256). Every parameter count,
-> corpus figure and "current training" claim below predates both, and every
-> checkpoint from before is unloadable. For current state see
-> [`docs/00_Index.md`](docs/00_Index.md).
+> **Historical document (2026-09) — read with care.** Every parameter count,
+> corpus figure and "current training" claim below predates the 2026-10
+> changes, and every checkpoint from before is unloadable. Current state, as
+> checked by `scripts/check_configs.py`:
 >
-> **Third change (also 2026-10).** The tokenizer was upgraded from a
-> 16,384-token BPE to a **199,995-token** one (measured 5.43 vs 3.34
-> chars/token). That alone adds 47M parameters at hidden 256 and moves the
-> token cache to uint32 / 6.0 GB. The `config_3m.yaml` and `config_15m.yaml`
-> files referenced below were deleted; only `config.yaml` (260M),
-> `config_50m.yaml` (92.6M), `config_20b.yaml` (21.0B) and
-> `config_baseline_feedforward.yaml` remain.
+> - **Corpus:** HuggingFace `HuggingFaceFW/fineweb-edu` (`sample-10BT`), 1.5B
+>   tokens, auto-fetched, cleaned, deduplicated, with `<|endoftext|>` between
+>   documents (openwebtext was used briefly in between and is superseded).
+> - **Tokenizer:** 16,384-token BPE re-fitted on that corpus. A 199,995-token
+>   vocab was trialled and not adopted.
+> - **Configs:** `config.yaml` / `config_baseline_feedforward.yaml` are 163.6M
+>   params on the original 618-edge wiring (the depth_sweeps A/B pair);
+>   `config_50m.yaml` is 68.9M and `config_20b.yaml` 21.0B, both with the
+>   brain-like wiring (`diagonal: true`, `long_range_prob: 0.3`,
+>   `max_long_range: 8`). `config_3m.yaml` and `config_15m.yaml`, referenced
+>   below, were deleted.
+>
+> For current state see [`docs/00_Index.md`](docs/00_Index.md).
 
 ## Brutal Gap Analysis & Realistic 2M Parameter Experiment Plan
 
