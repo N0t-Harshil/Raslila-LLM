@@ -96,6 +96,16 @@ def _require_datasets():
     try:
         from datasets import load_dataset  # noqa: F401
     except ImportError as exc:
+        if 'numpy' in str(exc).lower():
+            # `datasets` IS installed; one of its dependencies (usually pyarrow)
+            # was built for a different NumPy major version than the one here.
+            raise SystemExit(
+                'The `datasets` package is installed but cannot import because of a\n'
+                'NumPy version conflict:\n  {}\n'
+                'Fix (pick one):\n'
+                '  pip install -U "numpy>=2"            # if torch >= 2.3\n'
+                '  pip install "numpy<2" "pyarrow<20"   # if torch is older\n'
+                'Then check: python -c "import numpy, torch, pyarrow, datasets"'.format(exc))
         raise SystemExit(
             'The `datasets` package is required to fetch a HuggingFace corpus.\n'
             '  pip install datasets\n'

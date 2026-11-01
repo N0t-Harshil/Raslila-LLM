@@ -130,9 +130,50 @@ def ok(rc, what):
 # ---------------------------------------------------------------------------
 # commands
 # ---------------------------------------------------------------------------
+ENV_PROBE = r'''
+import importlib, warnings
+for name in ("numpy", "torch", "pyarrow", "datasets", "tokenizers", "yaml"):
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        try:
+            m = importlib.import_module(name)
+        except Exception as e:
+            print("FAIL", name, type(e).__name__ + ":", str(e).splitlines()[0][:200])
+            continue
+    # e.g. torch built for NumPy 1.x warns at import and breaks later
+    bad = [str(w.message).splitlines()[0][:200] for w in caught if "numpy" in str(w.message).lower()]
+    if bad:
+        print("FAIL", name, "NumPy warning:", bad[0])
+    else:
+        print("OK  ", name, getattr(m, "__version__", ""))
+'''
+
+
+def check_env():
+    """Import every package training needs in a fresh interpreter; explain conflicts."""
+    out = subprocess.run([PY, '-c', ENV_PROBE], cwd=ROOT, capture_output=True,
+                         text=True, encoding='utf-8', errors='replace').stdout
+    print(out.rstrip())
+    fails = [ln for ln in out.splitlines() if ln.startswith('FAIL')]
+    if not fails:
+        return True
+    if any('numpy' in ln.lower() for ln in fails):
+        print('\nNumPy version conflict: a package was built for a different NumPy major\n'
+              'version than the one installed. Fix (pick one), then rerun this command:\n'
+              '  pip install -U "numpy>=2"            # if torch >= 2.3\n'
+              '  pip install "numpy<2" "pyarrow<20"   # if torch is older')
+    else:
+        print('\nSome packages failed to import; install them with:\n'
+              '  pip install -r requirements.txt')
+    return False
+
+
 def cmd_setup(args):
     banner('Installing requirements')
     ok(run([PY, '-m', 'pip', 'install', '-r', 'requirements.txt'], 'setup'), 'pip install')
+    banner('Checking packages import together')
+    if not check_env():
+        return 1
     banner('Hardware')
     import torch
     print('torch', torch.__version__)
@@ -153,6 +194,9 @@ def cmd_check(args):
 
 
 def cmd_data(args):
+    banner('Checking packages import together')
+    if not check_env():
+        return 1
     banner('Preparing the dataset for {} (downloads once, then cached)'.format(args.config))
     cmd = [PY, 'scripts/get_dataset.py', '--config', args.config]
     if args.force:
