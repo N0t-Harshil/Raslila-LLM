@@ -102,10 +102,11 @@ def _require_datasets():
             raise SystemExit(
                 'The `datasets` package is installed but cannot import because of a\n'
                 'NumPy version conflict:\n  {}\n'
-                'Fix (pick one):\n'
-                '  pip install -U "numpy>=2"            # if torch >= 2.3\n'
-                '  pip install "numpy<2" "pyarrow<20"   # if torch is older\n'
-                'Then check: python -c "import numpy, torch, pyarrow, datasets"'.format(exc))
+                'Most conda/Jupyter images build torch, scipy and pandas against\n'
+                'NumPy 1.x, so keep NumPy 1 and pin pyarrow:\n'
+                '  pip install "numpy<2" "pyarrow<20"     (add "datasets<4.1" if pip refuses)\n'
+                'Only if all of those are NumPy-2 ready: pip install -U "numpy>=2"\n'
+                'Then check: python -c "import numpy, scipy, pandas, torch, pyarrow, datasets"'.format(exc))
         raise SystemExit(
             'The `datasets` package is required to fetch a HuggingFace corpus.\n'
             '  pip install datasets\n'

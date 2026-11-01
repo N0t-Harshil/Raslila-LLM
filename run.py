@@ -132,7 +132,7 @@ def ok(rc, what):
 # ---------------------------------------------------------------------------
 ENV_PROBE = r'''
 import importlib, warnings
-for name in ("numpy", "torch", "pyarrow", "datasets", "tokenizers", "yaml"):
+for name in ("numpy", "scipy", "pandas", "torch", "pyarrow", "datasets", "tokenizers", "yaml"):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
@@ -159,9 +159,11 @@ def check_env():
         return True
     if any('numpy' in ln.lower() for ln in fails):
         print('\nNumPy version conflict: a package was built for a different NumPy major\n'
-              'version than the one installed. Fix (pick one), then rerun this command:\n'
-              '  pip install -U "numpy>=2"            # if torch >= 2.3\n'
-              '  pip install "numpy<2" "pyarrow<20"   # if torch is older')
+              'version than the one installed. Most conda/Jupyter images build torch,\n'
+              'scipy and pandas against NumPy 1.x, so keep NumPy 1 and pin pyarrow:\n'
+              '  pip install "numpy<2" "pyarrow<20"   (add "datasets<4.1" if pip refuses)\n'
+              'Only if every package above is NumPy-2 ready instead: pip install -U "numpy>=2"\n'
+              'Cleanest: a fresh venv, then  pip install -r requirements.txt')
     else:
         print('\nSome packages failed to import; install them with:\n'
               '  pip install -r requirements.txt')
