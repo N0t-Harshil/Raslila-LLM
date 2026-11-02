@@ -168,12 +168,12 @@ class Sheet(nn.Module):
         x = h
         if self.lateral:
             nb = (self.adj.to(h.dtype) @ h.reshape(N, -1)).view_as(h)
-            x = x + self.lat_proj(self.lat_norm(nb))
+            x = x + self.lat_proj(self.lat_norm(nb)).to(h.dtype)
         if src is not None:
             if ascending and self.up is not None:
-                x = x + self.up(self.up_norm(src))
+                x = x + self.up(self.up_norm(src)).to(h.dtype)
             elif not ascending and self.down is not None:
-                x = x + self.down(self.down_norm(src))
+                x = x + self.down(self.down_norm(src)).to(h.dtype)
         for blk in self.blocks:
             x = blk(x, cos, sin)
         return x
@@ -193,7 +193,13 @@ class RaslilaGrid(nn.Module):
         self.in_proj = nn.Linear(e, d, bias=False)
         self.role = nn.Parameter(torch.randn(L, self.N, 1, 1, d) * 0.02)
         rng = random.Random(cfg.connectivity_seed)       # wiring only; never the global RNG
-        out_scale = 1.0 / (2 * L * cfg.node_depth) ** 0.5
+        # Residual branches added per readout path: layers x node_depth per
+        # sweep, times the sweeps run between two re-normalisations (a thinking
+        # cycle is down + up = 2; fixed depth is depth_sweeps). Scaling the
+        # output projections by 1/sqrt(2 * branches) keeps the stream's variance
+        # independent of how deep the loop runs (GPT-2 / LLaMA init rule).
+        sweeps_per_path = 2 if cfg.max_think_cycles > 0 else max(1, cfg.depth_sweeps)
+        out_scale = 1.0 / (2 * L * cfg.node_depth * sweeps_per_path) ** 0.5
         self.sheets = nn.ModuleList([
             Sheet(cfg, l, sheet_adjacency(R, C, cfg.diagonal, cfg.long_range_prob,
                                           cfg.max_long_range, rng), out_scale)
@@ -227,8 +233,13 @@ class RaslilaGrid(nn.Module):
         B, T = idx.shape
         cfg = self.config
         cos, sin = rope_tables(T, cfg.d_node // cfg.n_heads, cfg.rope_theta, idx.device)
-        x0 = self.in_proj(self.tok_emb(idx))                       # [B, T, D]
-        init = [x0.unsqueeze(0) + self.role[l].to(x0.dtype) for l in range(self.L)]
+        # The residual stream is kept in fp32 (as the baseline's is: its
+        # embedding output is fp32 and every block adds into it). Under bf16
+        # autocast in_proj returns bf16, and summing 20-60 residual updates in
+        # bf16 (8-bit mantissa) visibly costs quality. Matmuls still run in
+        # bf16; only the running sum is fp32.
+        x0 = self.in_proj(self.tok_emb(idx)).float()               # [B, T, D]
+        init = [x0.unsqueeze(0) + self.role[l].float() for l in range(self.L)]
         S = list(init)
         sweeps = 0
 
@@ -262,7 +273,7 @@ class RaslilaGrid(nn.Module):
                 if done:
                     break
             if self.cycle_norm is not None:
-                S = [self.cycle_norm(S[l]) + init[l] for l in range(self.L)]
+                S = [self.cycle_norm(S[l]).float() + init[l] for l in range(self.L)]
             sweep(False)
             sweep(True)
             logits = self._readout(S[-1])

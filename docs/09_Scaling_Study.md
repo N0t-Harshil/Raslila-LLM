@@ -152,3 +152,18 @@ val-loss history, loss per thinking cycle) and `log.csv`.
   a short LR sweep for Raslila at 50m is cheap and worth doing if it is close.
 - The 10B+ number in the report is an **extrapolation** of the fitted curves,
   labelled as such. It is how large runs are justified, but it is not a measurement.
+
+## Final pre-launch fixes (2026-11-02, configs frozen after this)
+- **Weight-decay bug fixed (trainer):** Raslila's per-block norm gains are
+  stored as `[N, 1, D]` tensors, so the "decay only tensors with dim >= 2" rule
+  was decaying them towards zero. Norm gains and grid roles are now excluded
+  by name.
+- **fp32 residual stream in Raslila v2:** the baseline's residual sum is fp32
+  (its embedding output is fp32), while Raslila's was bf16 after `in_proj`.
+  Summing dozens of updates in bf16 loses precision, so Raslila now keeps the
+  running state in fp32 (matmuls stay bf16), making the comparison fair.
+- **Init scaled for the loops:** output projections are scaled by
+  `1/sqrt(2 * layers * node_depth * sweeps_per_cycle)`; measured readout RMS is
+  flat (0.59-0.62) across 8 thinking cycles.
+- **z-loss 1e-4 for both families** (PaLM) against late-run logit drift. The
+  logged and validation losses are plain cross-entropy.

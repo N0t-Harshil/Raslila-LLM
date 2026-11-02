@@ -162,8 +162,14 @@ def main():
         p = min(1.0, (step - warmup) / max(1, steps - warmup))
         return lr_min + 0.5 * (lr_max - lr_min) * (1 + math.cos(math.pi * p))
 
-    decay = [p for p in model.parameters() if p.dim() >= 2]
-    no_decay = [p for p in model.parameters() if p.dim() < 2]
+    # Weight decay on weight matrices only. Norm gains, positional roles and
+    # biases are excluded BY NAME: Raslila stores per-block norm gains as
+    # [N, 1, D] tensors, so a `dim >= 2` rule alone would wrongly decay them
+    # towards zero (shrinking every block's input).
+    def no_wd(name, p):
+        return p.dim() < 2 or 'norm' in name.split('.')[-1] or name.endswith('role')
+    decay = [p for n, p in model.named_parameters() if not no_wd(n, p)]
+    no_decay = [p for n, p in model.named_parameters() if no_wd(n, p)]
     opt = torch.optim.AdamW([{'params': decay, 'weight_decay': float(tr.get('weight_decay', 0.1))},
                              {'params': no_decay, 'weight_decay': 0.0}],
                             lr=lr_max, betas=(0.9, 0.95), eps=1e-8,
@@ -197,6 +203,10 @@ def main():
     use_amp = device.type == 'cuda'
     peak = peak_flops(device)
     grad_clip = float(tr.get('grad_clip', 1.0))
+    # z-loss (PaLM): a tiny penalty on log Z keeps the output logits from
+    # drifting large, a known cause of late-run loss spikes. Same for both
+    # families; validation loss is plain cross-entropy.
+    z_loss = float(tr.get('z_loss', 1e-4))
     log_every = int(tr.get('log_every', 10))
     eval_every = int(tr.get('eval_every', 500))
     eval_batches = int(tr.get('eval_batches', 40))
@@ -290,11 +300,16 @@ def main():
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
                     out = model(x, think_cycles=cycles) if adaptive else model(x)
                     exits = out['exit_logits']
-                    loss = torch.stack([F.cross_entropy(e.float().reshape(-1, e.size(-1)),
-                                                        y.reshape(-1), ignore_index=0)
-                                        for e in exits]).mean()
+                    ce, zl = [], []
+                    for e in exits:
+                        ef = e.float().reshape(-1, e.size(-1))
+                        ce.append(F.cross_entropy(ef, y.reshape(-1), ignore_index=0))
+                        if z_loss > 0:
+                            zl.append(torch.logsumexp(ef, dim=-1).pow(2).mean())
+                    task_loss = torch.stack(ce).mean()
+                    loss = task_loss + (z_loss * torch.stack(zl).mean() if zl else 0.0)
                 (loss / accum).backward()
-            step_loss += loss.item() / accum
+            step_loss += task_loss.item() / accum          # logged loss = cross-entropy only
             if family == 'raslila':
                 step_flops += raw.flops_per_token(seq_len, sweeps=out['sweeps'],
                                                   exits=len(exits)) * x.numel()
