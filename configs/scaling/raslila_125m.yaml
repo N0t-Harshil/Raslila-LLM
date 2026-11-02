@@ -1,0 +1,37 @@
+# Scaling study, tier 125m: RASLILA v2 (3D grid, thinking loops).
+# Pair: configs/scaling/baseline_125m.yaml (same data, tokens, lr, batch).
+# Training samples 1 or 2 thinking cycles per step (1 cycle = one bottom-up
+# sweep, 2 = up, down through feedback, up again) and supervises both exits;
+# eval reports the loss after each cycle. Compute is measured, not assumed.
+model:
+  family: raslila
+  vocab_size: 32768
+  grid_shape: [3, 4, 4]
+  d_node: 256
+  n_heads: 4
+  node_depth: 2
+  d_embed: 768
+  max_think_cycles: 2
+  depth_sweeps: 2
+  lateral: true
+  feedback: true
+  long_range_prob: 0.1
+  max_long_range: 3
+  connectivity_seed: 42
+  activation_checkpoint: true
+train:
+  tokens: 2.5e9           # SAME token budget for both families in this tier (~20 tokens/param)
+  seq_len: 1024
+  batch_tokens: 524288    # 0.5M tokens per optimizer step (GPT-3 recipe)
+  micro_batch: 8      # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  lr: 6.0e-4
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_every: 250
+  eval_batches: 40
+  log_every: 10
+  save_every_minutes: 30
+  seed: 1234
+data: configs/data.yaml
+out_dir: runs/raslila_125m

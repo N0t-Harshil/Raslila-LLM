@@ -1,0 +1,46 @@
+# Training corpus for the scaling study -- shared by EVERY model, both families.
+# Build once:   python run.py data        (streams from the HuggingFace Hub)
+#
+# Size: 21B tokens = the largest run (1B tier, 20B tokens) without repeating
+# data. Disk: 42 GB (uint16) in data/mix/. Build time depends on the network
+# and CPU; the log prints tokens/s and an ETA every minute. If you only want the
+# 50M-350M tiers first, lower max_tokens to 7.5e9 (15 GB); raising it later
+# rebuilds the cache (the tokenizer is kept).
+data:
+  max_tokens: 2.1e10
+  val_tokens: 2.0e7            # held-out head of the stream (already mixed)
+  cache: data/mix/tokens.bin
+  tokenizer: data/mix/tokenizer.json
+  vocab_size: 32768            # code + maths need more merges than prose-only 16k
+  tokenizer_sample_chars: 1.0e9
+  split_digits: true           # one token per digit (arithmetic sees place value)
+  shuffle_seed: 1234
+  shuffle_buffer: 10000
+  dedup: true                  # exact-duplicate documents dropped across all sources
+  min_chars: 200
+  min_alpha_frac: 0.6
+
+  sources:
+    # General knowledge: educational web pages (FineWeb-Edu, arXiv 2406.17557).
+    - name: HuggingFaceFW/fineweb-edu
+      config: sample-100BT
+      text_field: text
+      weight: 0.60
+    # Facts: English Wikipedia.
+    - name: wikimedia/wikipedia
+      config: 20231101.en
+      text_field: text
+      weight: 0.10
+      min_chars: 500
+    # Maths: step-by-step maths pages (FineMath 4+, arXiv 2502.02737).
+    # LaTeX is symbol-heavy, so the letters-and-spaces threshold is lower.
+    - name: HuggingFaceTB/finemath
+      config: finemath-4plus
+      text_field: text
+      weight: 0.15
+      min_alpha_frac: 0.4
+    # Code: deduplicated Python from GitHub.
+    - name: codeparrot/codeparrot-clean
+      text_field: content
+      weight: 0.15
+      min_alpha_frac: 0.4

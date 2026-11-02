@@ -651,3 +651,25 @@ depth_layers/grid_h/grid_w (resolved in `RaslilaConfig.__post_init__`; mutually
 exclusive with `layer_shapes`). All configs now use it; parameter counts are
 unchanged (163,605,123 / 68,903,971). Checked at [7,3,10], [2,9,4], [1,1,12],
 [10,2,2] and [3,6,1], with every parameter receiving a gradient.
+
+## 2026-11 (1) - A100 results, the NaN, and the move to a scaling study
+
+**Measured on the A100.** The depth_sweeps A/B finished at 20,000 steps:
+bidirectional (2 sweeps) 5.4578 vs feedforward (1 sweep) 5.4664 train loss, so
+A was better by 0.0086 nats, which is noise at 2x the compute; val loss for B was
+5.4610. Each "step" was 8 x 128 = 1,024 tokens, so the whole run saw 20.5M tokens
+at ~1,000 tokens/s, about 150-200x slower than a standard transformer of the same
+size on the same GPU.
+
+**The adaptive run diverged.** grad_norm 110 (step 1200) -> 4e4 -> 4e8 -> 1e14 ->
+inf (1400), loss NaN from step 1600. Cause, measured: the state grew ~7x per
+thinking cycle (readout RMS 0.2 -> 1.7 -> 11 -> 80 -> 713 -> ... over cycles),
+because every sweep adds alpha*src + beta*tgt on top of each block's residual
+output. Fix: re-normalise the state and re-inject the input between cycles
+(`cycle_norm`); RMS is now 0.2 -> 3.9 -> 5.8 -> 6.4 -> 6.5 and flat to 8 cycles.
+The trainer also skips updates with a non-finite gradient norm.
+
+**Decision.** Making v1 bigger cannot work at its speed. The project now runs
+a matched scaling study, Raslila v2 (batched grid) against a standard
+transformer at 50M-1B, on a general + maths + code corpus. See
+[09 Scaling Study](09_Scaling_Study.md).

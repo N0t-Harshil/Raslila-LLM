@@ -734,6 +734,17 @@ class Raslila(nn.Module):
         # explode (loss ~100 at init). Identity in legacy post-norm mode.
         self.final_norm = RMSNorm(config.hidden_dim) if config.use_rmsnorm else nn.Identity()
 
+        # Thinking-loop stabiliser (adaptive depth only). Every sweep adds the
+        # alpha/beta interference on top of each block's residual output, so the
+        # node states grow ~7x per down+up cycle. Measured: 0.2 -> 80 -> 712 ->
+        # 4877 over cycles 1..6; at 4 cycles in bf16 that overflowed and the
+        # adaptive run went to NaN at step ~1600. Between cycles the state is
+        # re-normalised and the original input is re-injected (the recurrent-
+        # depth recipe), so each loop starts from the same scale and never
+        # forgets the question, however many loops run.
+        self.cycle_norm = (RMSNorm(config.hidden_dim)
+                           if int(getattr(config, 'max_think_cycles', 0) or 0) > 0 else None)
+
         # Shared neuromodulation gate for incoming edge messages.
         # Only built when actually enabled: the forward pass reads it solely
         # under `if self.config.gated_messages`, so with gating off these
@@ -1291,6 +1302,7 @@ class Raslila(nn.Module):
         # Give each node a location-aware role identity so nodes specialize.
         roles = self.node_role_net(self.node_positions)  # [N, D]
         node_states = x.unsqueeze(2) + roles.view(1, 1, self.n_nodes, self.hidden_dim)
+        init_states = node_states
 
         node_activations = []
         prev_mag = None  # per-node message magnitude (surprise) from last round
@@ -1499,6 +1511,8 @@ class Raslila(nn.Module):
                     settled, prev_p = self._settled(logits, prev_p)
                     if settled:
                         break
+                if self.cycle_norm is not None:
+                    node_states = self.cycle_norm(node_states) + init_states
                 run_sweep(False)
                 run_sweep(True)
                 logits, final_repr = readout(node_states)

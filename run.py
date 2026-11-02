@@ -1,38 +1,31 @@
-"""One entry point for everything: setup, data, training, benchmarking, chatting.
+"""Raslila: one entry point. Every command logs to logs/<command>_<time>.log.
 
-    python run.py <command> [options]          python run.py <command> --help
+    python run.py <command> [options]        python run.py <command> --help
 
-FIRST TIME ON THE A100 (in order)
-    python run.py setup          install requirements, show GPU
-    python run.py check          validate every config (must pass)
-    python run.py data           download + clean + tokenize FineWeb-Edu (~3 GB, once)
-    python run.py smoke          3-step training run: catches config/OOM problems in minutes
+THE PLAN (scaling study: does the 3D brain grid beat a standard transformer?)
+    1. python run.py setup            install requirements, check packages, list GPUs
+    2. python run.py check            validate the study configs (fair pairs, sizes, cost)
+    3. python run.py smoke            seconds-long runs of both models (no data needed)
+    4. python run.py data             build the general+math+code corpus (once, cached)
+    5. python run.py speed            FIRST GO/NO-GO: Raslila vs baseline tokens/s on your GPU
+    6. python run.py study            train every size of both models on all GPUs
+                                      (50M, 125M, 350M pairs one per GPU, then 1B on all 4)
+    7. python run.py report           table + scaling plot + head-to-head verdict
 
-THE EXPERIMENTS
-    python run.py ab             depth_sweeps A/B: bidirectional (2) vs feedforward (1)
-    python run.py compare        verdict for the A/B (decision rule fixed in advance)
-    python run.py train --config config_adaptive.yaml      adaptive-depth model
-    python run.py eval  --config config_adaptive.yaml      score it: loss, speed, thinking cycles
+SINGLE RUNS / USING A MODEL
+    python run.py scale --tier 125m --family raslila [--gpus 4]   one training run
+    python run.py generate --run raslila_125m --prompt "..."      sample text
+    python run.py live --run raslila_125m                         always-on chat session
+    python run.py legacy <command>                                old v1 commands
 
-EVERYTHING ELSE
-    python run.py train          train any config (default config.yaml); --resume latest
-    python run.py eval           evaluate the latest checkpoint of a config
-    python run.py bench          architecture benchmarks (GPT vs Raslila, ablations)
-    python run.py generate       sample text from a checkpoint
-    python run.py live           always-on chat session (rests when idle, input mid-answer)
-    python run.py all            check -> data -> smoke -> ab -> compare -> adaptive train -> eval
-
-Every command that runs a script also writes its full output to logs/<command>_<time>.log.
-Long runs over SSH: start them inside `tmux` or `screen` (or with `nohup ... &`) so a
-dropped connection does not kill training. Interrupted training resumes with
-`python run.py train --config <same config> --resume latest`.
+Training resumes automatically from runs/<name>/ckpt.pt, so if anything stops
+(crash, reboot, Ctrl+C) just run the same command again. Long runs over SSH:
+start them inside `tmux` so a dropped connection does not kill them.
 """
 import argparse
 import datetime
-import glob
 import json
 import os
-import re
 import subprocess
 import sys
 import time
@@ -40,37 +33,29 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 PY = sys.executable
-AB_A = 'checkpoints/raslila_ab_a'
-AB_B = 'checkpoints/raslila_ab_b'
-
-
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-def rel(path, start=ROOT):
-    """Path relative to the project if possible (Windows cannot cross drives)."""
-    try:
-        return os.path.relpath(path, start)
-    except ValueError:
-        return path
+TIERS = ['50m', '125m', '350m', '1b']
+FAMILIES = ['raslila', 'baseline']
 
 
 def banner(text):
     print('\n' + '=' * 78 + '\n' + text + '\n' + '=' * 78, flush=True)
 
 
-def run(cmd, log_name):
-    """Run a command, streaming its output to the console AND a log file."""
+def log_path(name):
     os.makedirs(os.path.join(ROOT, 'logs'), exist_ok=True)
-    stamp = datetime.datetime.now().strftime('%Y%m%d_%H%M%S')
-    log_path = os.path.join(ROOT, 'logs', '{}_{}.log'.format(log_name, stamp))
-    print('>>> ' + ' '.join(cmd))
-    print('    (log: {})'.format(rel(log_path, ROOT)), flush=True)
-    env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8')
-    with open(log_path, 'w', encoding='utf-8') as log:
-        proc = subprocess.Popen(cmd, cwd=ROOT, env=env, stdout=subprocess.PIPE,
-                                stderr=subprocess.STDOUT, text=True,
-                                encoding='utf-8', errors='replace', bufsize=1)
+    return os.path.join(ROOT, 'logs', '{}_{}.log'.format(
+        name, datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
+
+
+def run(cmd, name, env=None):
+    """Run a command, streaming output to the console AND a log file."""
+    path = log_path(name)
+    print('>>> ' + ' '.join(cmd) + '\n    (log: {})'.format(os.path.relpath(path, ROOT)), flush=True)
+    full_env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', **(env or {}))
+    with open(path, 'w', encoding='utf-8') as log:
+        proc = subprocess.Popen(cmd, cwd=ROOT, env=full_env, stdout=subprocess.PIPE,
+                                stderr=subprocess.STDOUT, text=True, encoding='utf-8',
+                                errors='replace', bufsize=1)
         try:
             for line in proc.stdout:
                 sys.stdout.write(line)
@@ -79,352 +64,252 @@ def run(cmd, log_name):
         except KeyboardInterrupt:
             proc.terminate()
             proc.wait()
-            print('\n[interrupted -- resume training with --resume latest]')
+            print('\n[interrupted -- run the same command again to resume]')
             return 130
-    if proc.returncode != 0:
-        print('\n[{} exited with code {}; see {}]'.format(
-            log_name, proc.returncode, rel(log_path, ROOT)))
+    if proc.returncode:
+        print('\n[{} exited with code {}; see {}]'.format(name, proc.returncode, os.path.relpath(path, ROOT)))
     return proc.returncode
 
 
-def load_yaml(path):
-    import yaml
-    with open(os.path.join(ROOT, path), encoding='utf-8') as f:
-        return yaml.safe_load(f)
+def n_gpus():
+    try:
+        import torch
+        return torch.cuda.device_count()
+    except Exception:
+        return 0
 
 
-def out_dir_of(config):
-    return (load_yaml(config).get('training') or {}).get('out_dir', 'checkpoints/raslila')
+def train_cmd(config, gpus, extra=()):
+    if gpus > 1:
+        return [PY, '-m', 'torch.distributed.run', '--standalone',
+                '--nproc_per_node={}'.format(gpus), 'scripts/train_scaling.py', '--config', config] + list(extra)
+    return [PY, 'scripts/train_scaling.py', '--config', config] + list(extra)
 
 
-def latest_checkpoint(out_dir):
-    """Highest-step raslila_step*.pt in out_dir, or None."""
-    best, best_step = None, -1
-    for path in glob.glob(os.path.join(ROOT, out_dir, 'raslila_step*.pt')):
-        m = re.search(r'raslila_step(\d+)\.pt$', path)
-        if m and int(m.group(1)) > best_step:
-            best, best_step = path, int(m.group(1))
-    return best
+def run_status(name):
+    path = os.path.join(ROOT, 'runs', name, 'metrics.json')
+    if not os.path.exists(path):
+        return None
+    with open(path, 'r', encoding='utf-8') as f:
+        return json.load(f)
 
 
-def resolve_checkpoint(args):
-    if getattr(args, 'checkpoint', None) and args.checkpoint != 'latest':
-        return args.checkpoint
-    ck = latest_checkpoint(out_dir_of(args.config))
-    if ck is None:
-        sys.exit('No checkpoint found in {} -- train first, or pass --checkpoint PATH.'
-                 .format(out_dir_of(args.config)))
-    return ck
-
-
-def tokenizer_of(config):
-    from raslila.hf_dataset import resolve
-    return resolve(load_yaml(config).get('dataset')).get('tokenizer')
-
-
-def ok(rc, what):
-    if rc != 0:
-        sys.exit('STOPPED: {} failed (exit code {}).'.format(what, rc))
-
-
-# ---------------------------------------------------------------------------
-# commands
 # ---------------------------------------------------------------------------
 ENV_PROBE = r'''
 import importlib, warnings
-for name in ("numpy", "scipy", "pandas", "torch", "pyarrow", "datasets", "tokenizers", "yaml"):
+for name in ("numpy", "torch", "pyarrow", "datasets", "tokenizers", "yaml", "matplotlib"):
     with warnings.catch_warnings(record=True) as caught:
         warnings.simplefilter("always")
         try:
             m = importlib.import_module(name)
         except Exception as e:
-            print("FAIL", name, type(e).__name__ + ":", str(e).splitlines()[0][:200])
-            continue
-    # e.g. torch built for NumPy 1.x warns at import and breaks later
+            print("FAIL", name, type(e).__name__ + ":", str(e).splitlines()[0][:200]); continue
     bad = [str(w.message).splitlines()[0][:200] for w in caught if "numpy" in str(w.message).lower()]
-    if bad:
-        print("FAIL", name, "NumPy warning:", bad[0])
-    else:
-        print("OK  ", name, getattr(m, "__version__", ""))
+    print(("FAIL " + name + " NumPy warning: " + bad[0]) if bad else ("OK   " + name + " " + getattr(m, "__version__", "")))
 '''
 
 
 def check_env():
-    """Import every package training needs in a fresh interpreter; explain conflicts."""
-    out = subprocess.run([PY, '-c', ENV_PROBE], cwd=ROOT, capture_output=True,
-                         text=True, encoding='utf-8', errors='replace').stdout
+    out = subprocess.run([PY, '-c', ENV_PROBE], cwd=ROOT, capture_output=True, text=True,
+                         encoding='utf-8', errors='replace').stdout
     print(out.rstrip())
-    fails = [ln for ln in out.splitlines() if ln.startswith('FAIL')]
+    fails = [l for l in out.splitlines() if l.startswith('FAIL') and 'matplotlib' not in l]
     if not fails:
         return True
-    if any('numpy' in ln.lower() for ln in fails):
-        print('\nNumPy version conflict: a package was built for a different NumPy major\n'
-              'version than the one installed. Most conda/Jupyter images build torch,\n'
-              'scipy and pandas against NumPy 1.x, so keep NumPy 1 and pin pyarrow:\n'
-              '  pip install "numpy<2" "pyarrow<20"   (add "datasets<4.1" if pip refuses)\n'
-              'Only if every package above is NumPy-2 ready instead: pip install -U "numpy>=2"\n'
-              'Cleanest: a fresh venv, then  pip install -r requirements.txt')
+    if any('numpy' in l.lower() for l in fails):
+        print('\nNumPy version conflict. On conda/Jupyter images keep NumPy 1 and pin pyarrow:\n'
+              '  pip install "numpy<2" "pyarrow<20"    (add "datasets<4.1" if pip refuses)\n'
+              'Cleanest fix: a fresh venv, then pip install -r requirements.txt')
     else:
-        print('\nSome packages failed to import; install them with:\n'
-              '  pip install -r requirements.txt')
+        print('\nInstall the missing packages:  pip install -r requirements.txt')
     return False
 
 
-def cmd_setup(args):
+def cmd_setup(a):
     banner('Installing requirements')
-    ok(run([PY, '-m', 'pip', 'install', '-r', 'requirements.txt'], 'setup'), 'pip install')
-    banner('Checking packages import together')
+    if run([PY, '-m', 'pip', 'install', '-r', 'requirements.txt'], 'setup'):
+        return 1
+    banner('Packages')
     if not check_env():
         return 1
-    banner('Hardware')
+    banner('GPUs')
     import torch
-    print('torch', torch.__version__)
-    if torch.cuda.is_available():
-        for i in range(torch.cuda.device_count()):
-            p = torch.cuda.get_device_properties(i)
-            print('GPU {}: {} ({:.0f} GB), bf16 {}'.format(
-                i, p.name, p.total_memory / 1e9, torch.cuda.is_bf16_supported()))
-    else:
-        print('No CUDA GPU visible. Training will run on CPU (smoke tests only).')
-        print('On the A100 install the CUDA build of torch: https://pytorch.org/get-started/locally/')
+    print('torch', torch.__version__, '| CUDA', torch.version.cuda)
+    for i in range(torch.cuda.device_count()):
+        p = torch.cuda.get_device_properties(i)
+        print('GPU {}: {} ({:.0f} GB)'.format(i, p.name, p.total_memory / 1e9))
+    if not torch.cuda.is_available():
+        print('No CUDA GPU visible: install the CUDA build of torch (pytorch.org/get-started).')
     return 0
 
 
-def cmd_check(args):
-    banner('Validating configs')
-    return run([PY, 'scripts/check_configs.py'], 'check')
+def cmd_check(a):
+    banner('Validating scaling-study configs')
+    return run([PY, 'scripts/check_scaling.py'], 'check')
 
 
-def cmd_data(args):
-    banner('Checking packages import together')
+def cmd_smoke(a):
+    banner('Smoke test: both model families, random tokens, a few seconds each')
+    for fam in FAMILIES:
+        rc = run([PY, 'scripts/train_scaling.py', '--config', 'configs/scaling/smoke_{}.yaml'.format(fam),
+                  '--synthetic', '--fresh'], 'smoke_' + fam)
+        if rc:
+            return rc
+    print('\nSmoke OK. (Loss stays near ln(vocab) on random tokens -- that is expected.)')
+    return 0
+
+
+def cmd_data(a):
+    banner('Packages')
     if not check_env():
         return 1
-    banner('Preparing the dataset for {} (downloads once, then cached)'.format(args.config))
-    cmd = [PY, 'scripts/get_dataset.py', '--config', args.config]
-    if args.force:
-        cmd.append('--force')
-    if args.max_tokens:
-        cmd += ['--max-tokens', str(args.max_tokens)]
-    return run(cmd, 'data')
+    banner('Building the corpus from {} (cached; re-running is a no-op)'.format(a.config))
+    code = ('import sys; sys.path.insert(0, "src"); '
+            'from raslila.data_mix import load_data_config, build_cache; '
+            'build_cache(load_data_config({!r}), force={})'.format(a.config, bool(a.force)))
+    return run([PY, '-c', code], 'data')
 
 
-def cmd_smoke(args):
-    banner('Smoke test: 3 training steps on {}'.format(args.config))
-    return run([PY, 'scripts/train_raslila.py', '--config', args.config, '--steps', '3',
-                '--batch-size', '1', '--seq-len', '32', '--out-dir', 'checkpoints/smoke',
-                '--save-every', '0'], 'smoke')
+def cmd_speed(a):
+    banner('Speed test, tier {} (largest micro-batch that fits, then timed steps)'.format(a.tier))
+    cmd = [PY, 'scripts/speed_test.py', '--tier', a.tier]
+    if a.compile:
+        cmd.append('--compile')
+    return run(cmd, 'speed_' + a.tier)
 
 
-def cmd_train(args):
-    banner('Training {}'.format(args.config))
-    cmd = [PY, 'scripts/train_raslila.py', '--config', args.config]
-    if args.steps:
-        cmd += ['--steps', str(args.steps)]
-    if args.batch_size:
-        cmd += ['--batch-size', str(args.batch_size)]
-    if args.save_every:
-        cmd += ['--save-every', str(args.save_every)]
-    if args.out_dir:
-        cmd += ['--out-dir', args.out_dir]
-    if args.resume:
-        ck = args.resume
-        if ck == 'latest':
-            ck = latest_checkpoint(args.out_dir or out_dir_of(args.config))
-            if ck is None:
-                print('No checkpoint to resume from -- starting fresh.')
-        if ck:
-            cmd += ['--resume', ck]
-    if args.gpus > 1:
-        cmd = ['torchrun', '--standalone', '--nproc_per_node={}'.format(args.gpus)] + cmd[1:]
-    return run(cmd, 'train_' + os.path.splitext(os.path.basename(args.config))[0])
+def cmd_scale(a):
+    fams = FAMILIES if a.family == 'both' else [a.family]
+    for fam in fams:
+        cfg = 'configs/scaling/{}_{}.yaml'.format(fam, a.tier)
+        banner('Training {} on {} GPU(s)'.format(cfg, a.gpus))
+        extra = ['--compile'] if a.compile else []
+        if a.micro_batch:
+            extra += ['--micro-batch', str(a.micro_batch)]
+        rc = run(train_cmd(cfg, a.gpus, extra), 'train_{}_{}'.format(fam, a.tier))
+        if rc:
+            return rc
+    return 0
 
 
-def cmd_ab(args):
-    banner('A/B: config.yaml (depth_sweeps 2) vs config_baseline_feedforward.yaml (1)\n'
-           'Arms run one after the other, {} GPU(s) each.'.format(args.gpus))
-    cmd = [PY, 'scripts/run_ab.py', '--nproc', str(args.gpus)]
-    if args.steps:
-        cmd += ['--steps', str(args.steps)]
-    return run(cmd, 'ab')
+def cmd_study(a):
+    """Schedule the whole study over the GPUs. Small tiers: one run per GPU in
+    parallel. Tiers in --multi-gpu-tiers: one run at a time on all GPUs."""
+    gpus = a.gpus or n_gpus()
+    if gpus < 1:
+        sys.exit('No GPUs visible.')
+    tiers = [t for t in TIERS if t in a.tiers.split(',')]
+    multi = set(a.multi_gpu_tiers.split(',')) if gpus > 1 else set()
+    single = [(f, t) for t in tiers if t not in multi for f in FAMILIES]
+    big = [(f, t) for t in tiers if t in multi for f in FAMILIES]
+    todo = []
+    for f, t in single + big:
+        st = run_status('{}_{}'.format(f, t))
+        if st and st.get('finished'):
+            print('done already: {}_{} (val {:.4f})'.format(f, t, st['val_loss']))
+        else:
+            todo.append((f, t))
+    banner('Study on {} GPU(s): {}'.format(gpus, ', '.join('{}_{}'.format(f, t) for f, t in todo) or 'nothing to do'))
+    extra = ['--compile'] if a.compile else []
+
+    def launch(fam, tier, devices):
+        cfg = 'configs/scaling/{}_{}.yaml'.format(fam, tier)
+        path = log_path('study_{}_{}'.format(fam, tier))
+        env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
+                   CUDA_VISIBLE_DEVICES=','.join(map(str, devices)))
+        f = open(path, 'w', encoding='utf-8')
+        p = subprocess.Popen(train_cmd(cfg, len(devices), extra), cwd=ROOT, env=env,
+                             stdout=f, stderr=subprocess.STDOUT)
+        print('[{}] START {}_{} on GPU {} -> {}'.format(time.strftime('%H:%M'), fam, tier,
+                                                        ','.join(map(str, devices)), os.path.relpath(path, ROOT)),
+              flush=True)
+        return p, f, path
+
+    def tail(path):
+        try:
+            with open(path, 'r', encoding='utf-8', errors='replace') as f:
+                lines = [l.strip() for l in f.readlines()[-30:] if l.startswith('step')]
+            return lines[-1] if lines else ''
+        except OSError:
+            return ''
+
+    failed = []
+    queue = [j for j in todo if j[1] not in multi]
+    running = {}                                   # gpu -> (job, proc, file, path)
+    last_report = time.time()
+    try:
+        while queue or running:
+            for g in range(gpus):
+                if g not in running and queue:
+                    job = queue.pop(0)
+                    running[g] = (job,) + launch(job[0], job[1], [g])
+            time.sleep(20)
+            for g, (job, p, f, path) in list(running.items()):
+                if p.poll() is not None:
+                    f.close()
+                    del running[g]
+                    if p.returncode:
+                        failed.append(job)
+                        print('[{}] FAILED {}_{} (exit {}), see {}'.format(
+                            time.strftime('%H:%M'), job[0], job[1], p.returncode, os.path.relpath(path, ROOT)))
+                    else:
+                        st = run_status('{}_{}'.format(*job)) or {}
+                        print('[{}] DONE {}_{}: val loss {}'.format(time.strftime('%H:%M'), job[0], job[1],
+                                                                  st.get('val_loss')), flush=True)
+            if time.time() - last_report > 600 and running:
+                last_report = time.time()
+                for g, (job, _, _, path) in running.items():
+                    print('  GPU {} {}_{}: {}'.format(g, job[0], job[1], tail(path)), flush=True)
+        for job in [j for j in todo if j[1] in multi]:
+            p, f, path = launch(job[0], job[1], list(range(gpus)))
+            while p.poll() is None:
+                time.sleep(600)
+                print('  {}_{}: {}'.format(job[0], job[1], tail(path)), flush=True)
+            f.close()
+            if p.returncode:
+                failed.append(job)
+                print('FAILED {}_{}, see {}'.format(job[0], job[1], os.path.relpath(path, ROOT)))
+            else:
+                print('DONE {}_{}: val loss {}'.format(job[0], job[1], (run_status('{}_{}'.format(*job)) or {}).get('val_loss')))
+    except KeyboardInterrupt:
+        print('\nStopping all runs (they resume from their last checkpoint when you re-run `study`).')
+        for job, p, f, _ in running.values():
+            p.terminate()
+        return 130
+    cmd_report(a)
+    return 1 if failed else 0
 
 
-def cmd_compare(args):
-    banner('A/B verdict')
-    a, b = args.run_a or AB_A, args.run_b or AB_B
-    cmd = [PY, 'scripts/compare_runs.py', a, b]
-    if args.min_steps:
-        cmd += ['--min-steps', str(args.min_steps)]
-    return run(cmd, 'compare')
+def cmd_report(a):
+    banner('Scaling report')
+    return run([PY, 'scripts/scaling_report.py'], 'report')
 
 
-def cmd_bench(args):
-    banner('Architecture benchmark: {}'.format(args.mode))
-    return run([PY, 'scripts/benchmark_gpt_vs_raslila.py', '--mode', args.mode,
-                '--steps', str(args.steps)], 'bench_' + args.mode)
-
-
-def cmd_generate(args):
-    ck = resolve_checkpoint(args)
-    cmd = [PY, 'scripts/generate_raslila.py', '--checkpoint', ck, '--config', args.config,
-           '--tokenizer', tokenizer_of(args.config), '--prompt', args.prompt,
-           '--tokens', str(args.tokens), '--temperature', str(args.temperature)]
+def cmd_generate(a):
+    cmd = [PY, 'scripts/generate_scaling.py', '--run', a.run, '--prompt', a.prompt,
+           '--tokens', str(a.tokens), '--temperature', str(a.temperature)]
+    if a.think:
+        cmd += ['--think', str(a.think)]
     return run(cmd, 'generate')
 
 
-def cmd_live(args):
-    ck = resolve_checkpoint(args)
-    cmd = [PY, 'scripts/raslila_live.py', '--checkpoint', ck, '--config', args.config,
-           '--tokenizer', tokenizer_of(args.config)]
-    if args.inbox:
-        cmd += ['--inbox', args.inbox]
-    if args.offload:
+def cmd_live(a):
+    from raslila.data_mix import load_data_config
+    tok = load_data_config('configs/data.yaml')['tokenizer']
+    cmd = [PY, 'scripts/raslila_live.py', '--checkpoint', os.path.join('runs', a.run, 'ckpt.pt'),
+           '--tokenizer', tok, '--window', '1024']
+    if a.inbox:
+        cmd += ['--inbox', a.inbox]
+    if a.offload:
         cmd.append('--offload')
     print('>>> ' + ' '.join(cmd), flush=True)
-    # Interactive: hand the terminal over directly (no log tee).
     return subprocess.call(cmd, cwd=ROOT)
 
 
-def cmd_eval(args):
-    """Score a checkpoint on the held-out slice: loss, perplexity, speed, and
-    (adaptive models) loss per thinking depth + how often it stops early."""
-    import math
-    import numpy as np
-    import torch
-    import torch.nn.functional as F
-    from raslila.raslila import Raslila, RaslilaConfig
-    from raslila.hf_dataset import resolve
-
-    ck_path = resolve_checkpoint(args)
-    raw = load_yaml(args.config)
-    ds = resolve(raw.get('dataset'))
-    seq_len = int((raw.get('training') or {}).get('seq_len', 128))
-    val_tokens = int(ds.get('val_tokens') or 0)
-    cache = os.path.join(ROOT, ds['cache'])
-    if not os.path.exists(cache):
-        sys.exit('Token cache {} not found -- run `python run.py data` first.'.format(cache))
-    corpus = np.load(cache, mmap_mode='r')
-    if val_tokens > seq_len + 1:
-        val = corpus[:val_tokens]
-        held_out = True
-    else:
-        val = corpus[-2_000_000:]
-        held_out = False
-
-    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-    ckpt = torch.load(ck_path, map_location='cpu')
-    model = Raslila(RaslilaConfig(**ckpt['config']))
-    model.load_state_dict(ckpt['model'])
-    model.to(device).eval()
-    use_bf16 = device.type == 'cuda'
-    max_think = int(model.config.max_think_cycles or 0)
-
-    banner('Evaluating {}\n  step {}, {:.1f}M params, {} on {}{}'.format(
-        rel(ck_path, ROOT), ckpt.get('step'),
-        sum(p.numel() for p in model.parameters()) / 1e6,
-        'adaptive depth (max {} cycles)'.format(max_think) if max_think else
-        'fixed depth ({} sweeps)'.format(model.config.depth_sweeps), device,
-        '' if held_out else '\n  WARNING: dataset.val_tokens is 0, so this uses the cache tail, '
-                            'which training may have seen'))
-
-    n = max(1, min(args.windows, (len(val) - seq_len - 1) // max(1, seq_len)))
-    starts = np.linspace(0, len(val) - seq_len - 1, num=n, dtype=np.int64)
-    idx = starts[:, None] + np.arange(seq_len)[None, :]
-    X = torch.from_numpy(np.asarray(val[idx]).astype(np.int64))
-    Y = torch.from_numpy(np.asarray(val[idx + 1]).astype(np.int64))
-
-    def mean_loss(**kw):
-        total, count = 0.0, 0
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-            for i in range(0, n, args.batch_size):
-                x, y = X[i:i + args.batch_size].to(device), Y[i:i + args.batch_size].to(device)
-                logits = model(x, **kw)['logits'].float()
-                total += F.cross_entropy(logits.reshape(-1, logits.size(-1)), y.reshape(-1),
-                                         ignore_index=0, reduction='sum').item()
-                count += int((y != 0).sum())
-        return total / max(1, count)
-
-    results = {'checkpoint': rel(ck_path, ROOT), 'step': ckpt.get('step'),
-               'windows': int(n), 'seq_len': seq_len, 'held_out': held_out}
-    full = mean_loss(halt=False)
-    results['val_loss'] = full
-    results['perplexity'] = math.exp(min(full, 50))
-    print('val loss (full depth): {:.4f}   perplexity: {:.1f}   ({} windows x {} tokens)'.format(
-        full, results['perplexity'], n, seq_len))
-
-    # speed: forward tokens per second at the eval batch size
-    x = X[:args.batch_size].to(device)
-    with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-        model(x, halt=False)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-        t0 = time.perf_counter()
-        reps = 3
-        for _ in range(reps):
-            model(x, halt=False)
-        if device.type == 'cuda':
-            torch.cuda.synchronize()
-    tps = reps * x.numel() / (time.perf_counter() - t0)
-    results['forward_tokens_per_s'] = tps
-    print('speed: {:,.0f} tokens/s forward (batch {} x {})'.format(tps, x.size(0), seq_len))
-
-    if max_think:
-        print('\nthinking depth -> val loss (lower = better; does more thinking help?)')
-        per = {}
-        for c in range(1, max_think + 1):
-            per[c] = mean_loss(think_cycles=c, halt=False)
-            print('  {} cycle{}: {:.4f}'.format(c, 's' if c > 1 else ' ', per[c]))
-        results['loss_by_cycles'] = per
-        # Halting is decided on the LAST position, so measure it per window
-        # (batch 1) on the token each window is about to produce.
-        used, nll_halt, nll_full = [], 0.0, 0.0
-        with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-            for i in range(min(n, args.halt_windows)):
-                x, y = X[i:i + 1].to(device), Y[i, -1].item()
-                out = model(x, halt=True)
-                used.append(out['cycles_used'])
-                nll_halt += -torch.log_softmax(out['logits'][0, -1].float(), -1)[y].item()
-                nll_full += -torch.log_softmax(model(x, halt=False)['logits'][0, -1].float(), -1)[y].item()
-        k = len(used)
-        hist = {c: used.count(c) for c in range(1, max_think + 1)}
-        results.update(avg_cycles_used=sum(used) / k, cycles_histogram=hist,
-                       last_token_loss_halting=nll_halt / k, last_token_loss_full=nll_full / k)
-        print('\nwith early stopping ({} samples): avg {:.2f} of {} cycles used'.format(
-            k, sum(used) / k, max_think))
-        for c, cnt in hist.items():
-            print('  stopped after {} cycle{}: {:5.1%} {}'.format(
-                c, 's' if c > 1 else ' ', cnt / k, '#' * int(40 * cnt / k)))
-        print('  next-token loss: early-stopping {:.4f} vs always-full {:.4f} '
-              '(close = stopping early costs little)'.format(nll_halt / k, nll_full / k))
-
-    out_path = os.path.join(os.path.dirname(ck_path), 'eval_step{}.json'.format(ckpt.get('step')))
-    with open(out_path, 'w', encoding='utf-8') as f:
-        json.dump(results, f, indent=2)
-    print('\nsaved: {}'.format(rel(out_path, ROOT)))
-    return 0
+def cmd_legacy(a):
+    return subprocess.call([PY, 'scripts/legacy_run.py'] + a.rest, cwd=ROOT)
 
 
-def cmd_all(args):
-    steps = args.steps
-    for name, fn, extra in [
-            ('check', cmd_check, {}),
-            ('data', cmd_data, {'force': False, 'max_tokens': None}),
-            ('smoke', cmd_smoke, {}),
-            ('A/B', cmd_ab, {'steps': steps}),
-            ('compare', cmd_compare, {'run_a': None, 'run_b': None, 'min_steps': steps}),
-    ]:
-        ns = argparse.Namespace(config='config.yaml', gpus=args.gpus, **extra)
-        ok(fn(ns), name)
-    ns = argparse.Namespace(config='config_adaptive.yaml', steps=steps, batch_size=None,
-                            save_every=None, out_dir=None, resume=None, gpus=args.gpus)
-    ok(cmd_train(ns), 'adaptive training')
-    ns = argparse.Namespace(config='config_adaptive.yaml', checkpoint='latest',
-                            windows=128, batch_size=8, halt_windows=256)
-    ok(cmd_eval(ns), 'adaptive eval')
-    banner('All done. A/B verdict above; adaptive eval saved next to its checkpoint.')
-    return 0
-
-
-# ---------------------------------------------------------------------------
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest='command', metavar='command')
@@ -434,64 +319,49 @@ def main():
         p.set_defaults(fn=fn)
         return p
 
-    add('setup', cmd_setup, 'install requirements and show the GPU')
-    add('check', cmd_check, 'validate every config (must pass before a run)')
-    p = add('data', cmd_data, 'download, clean and tokenize the corpus (cached)')
-    p.add_argument('--config', default='config.yaml')
-    p.add_argument('--force', action='store_true', help='rebuild even if cached')
-    p.add_argument('--max-tokens', type=int, default=None, help='smaller slice for testing')
-    p = add('smoke', cmd_smoke, '3-step training run to catch problems early')
-    p.add_argument('--config', default='config.yaml')
-    p = add('train', cmd_train, 'train a config')
-    p.add_argument('--config', default='config.yaml')
-    p.add_argument('--steps', type=int, default=None, help='total steps (default: config)')
-    p.add_argument('--batch-size', type=int, default=None)
-    p.add_argument('--save-every', type=int, default=None)
-    p.add_argument('--out-dir', default=None)
-    p.add_argument('--resume', default=None, help='checkpoint path, or "latest"')
+    add('setup', cmd_setup, 'install requirements, check packages, list GPUs')
+    add('check', cmd_check, 'validate the scaling-study configs')
+    add('smoke', cmd_smoke, 'seconds-long runs of both models on random tokens')
+    p = add('data', cmd_data, 'build the general+math+code token cache (once)')
+    p.add_argument('--config', default='configs/data.yaml')
+    p.add_argument('--force', action='store_true')
+    p = add('speed', cmd_speed, 'tokens/s of Raslila vs baseline on this GPU')
+    p.add_argument('--tier', default='125m', choices=TIERS)
+    p.add_argument('--compile', action='store_true', help='also try torch.compile')
+    p = add('scale', cmd_scale, 'train one tier (one or both families)')
+    p.add_argument('--tier', required=True, choices=TIERS)
+    p.add_argument('--family', default='both', choices=FAMILIES + ['both'])
     p.add_argument('--gpus', type=int, default=1)
-    p = add('ab', cmd_ab, 'run the depth_sweeps A/B (both arms)')
-    p.add_argument('--steps', type=int, default=20000)
-    p.add_argument('--gpus', type=int, default=1)
-    p = add('compare', cmd_compare, 'A/B verdict from the two runs')
-    p.add_argument('run_a', nargs='?', default=None, help='default ' + AB_A)
-    p.add_argument('run_b', nargs='?', default=None, help='default ' + AB_B)
-    p.add_argument('--min-steps', type=int, default=None)
-    p = add('eval', cmd_eval, 'score a checkpoint: loss, speed, thinking cycles')
-    p.add_argument('--config', default='config.yaml')
-    p.add_argument('--checkpoint', default='latest')
-    p.add_argument('--windows', type=int, default=128, help='validation windows')
-    p.add_argument('--batch-size', type=int, default=8)
-    p.add_argument('--halt-windows', type=int, default=256,
-                   help='samples for the early-stopping measurement')
-    p = add('bench', cmd_bench, 'architecture benchmarks (short, small models)')
-    p.add_argument('--mode', default='gpt_vs_raslila',
-                   choices=['gpt_vs_raslila', 'legacy_vs_modern', 'plus', 'cortex', 'recur', 'bind'])
-    p.add_argument('--steps', type=int, default=200)
-    p = add('generate', cmd_generate, 'sample text from a checkpoint')
-    p.add_argument('--config', default='config.yaml')
-    p.add_argument('--checkpoint', default='latest')
+    p.add_argument('--micro-batch', type=int, default=None)
+    p.add_argument('--compile', action='store_true')
+    p = add('study', cmd_study, 'train every tier of both families across all GPUs')
+    p.add_argument('--gpus', type=int, default=None, help='default: all visible')
+    p.add_argument('--tiers', default='50m,125m,350m,1b')
+    p.add_argument('--multi-gpu-tiers', default='1b', help='tiers trained on all GPUs at once')
+    p.add_argument('--compile', action='store_true')
+    add('report', cmd_report, 'scaling table, plot and verdict from finished runs')
+    p = add('generate', cmd_generate, 'sample text from a trained run')
+    p.add_argument('--run', required=True, help='e.g. raslila_125m (a folder in runs/)')
     p.add_argument('--prompt', default='The most important idea in science is')
-    p.add_argument('--tokens', type=int, default=150)
+    p.add_argument('--tokens', type=int, default=200)
     p.add_argument('--temperature', type=float, default=0.8)
-    p = add('live', cmd_live, 'always-on chat session')
-    p.add_argument('--config', default='config_adaptive.yaml')
-    p.add_argument('--checkpoint', default='latest')
+    p.add_argument('--think', type=int, default=None, help='max thinking cycles (Raslila)')
+    p = add('live', cmd_live, 'always-on chat session with a trained run')
+    p.add_argument('--run', required=True)
     p.add_argument('--inbox', default='data/live_inbox')
-    p.add_argument('--offload', action='store_true', help='move weights to CPU while resting')
-    p = add('all', cmd_all, 'check -> data -> smoke -> A/B -> compare -> adaptive -> eval')
-    p.add_argument('--steps', type=int, default=20000)
-    p.add_argument('--gpus', type=int, default=1)
+    p.add_argument('--offload', action='store_true')
+    p = add('legacy', cmd_legacy, 'old Raslila v1 commands (python run.py legacy --help)')
+    p.add_argument('rest', nargs=argparse.REMAINDER)
 
-    args = ap.parse_args()
-    if not getattr(args, 'command', None):
+    a = ap.parse_args()
+    if not getattr(a, 'command', None):
         ap.print_help()
         return 0
     try:
         sys.stdout.reconfigure(encoding='utf-8')
     except Exception:
         pass
-    return args.fn(args) or 0
+    return a.fn(a) or 0
 
 
 if __name__ == '__main__':

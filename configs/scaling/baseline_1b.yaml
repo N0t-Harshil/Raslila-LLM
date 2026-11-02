@@ -1,0 +1,25 @@
+# Scaling study, tier 1b: STANDARD TRANSFORMER baseline (the yardstick).
+# Pair: configs/scaling/raslila_1b.yaml (same data, tokens, lr, batch).
+model:
+  family: baseline
+  vocab_size: 32768
+  d_model: 2048
+  n_layers: 18
+  n_heads: 16
+  activation_checkpoint: true
+train:
+  tokens: 2.0e10           # SAME token budget for both families in this tier (~20 tokens/param)
+  seq_len: 1024
+  batch_tokens: 524288    # 0.5M tokens per optimizer step (GPT-3 recipe)
+  micro_batch: 4      # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  lr: 2.0e-4
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_every: 250
+  eval_batches: 40
+  log_every: 10
+  save_every_minutes: 30
+  seed: 1234
+data: configs/data.yaml
+out_dir: runs/baseline_1b

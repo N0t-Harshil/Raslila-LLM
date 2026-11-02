@@ -1,0 +1,154 @@
+# 09 — The scaling study: does the 3D grid beat a standard transformer?
+
+*Started 2026-11-02. This is now the project's main line of work.*
+
+## Why this study exists: the measured state of v1
+
+The numbers below are from the A100 runs, read straight from the training logs.
+
+| measurement | value |
+|---|---|
+| v1 model (`config.yaml`) | 163.6M params, 5×5×5 grid, 618 edge MLPs |
+| tokens per training "step" | 8 × 128 = **1,024** |
+| whole 20,000-step run | **20.5M tokens** in 20,071 s ≈ **1,000 tokens/s** |
+| final val loss (sweeps=1) | **5.461** (FineWeb-Edu, 16k BPE) |
+| A/B: bidirectional sweeps vs feedforward | **−0.009 nats** (within noise) at **2× compute** |
+| adaptive-depth run | went to **NaN** at step ~1,600 (see the fix below) |
+| standard 124M transformer, same GPU (public llm.c / nanoGPT results) | **~200,000 tokens/s** |
+
+Three conclusions:
+
+1. **v1 is ~150–200× slower per token than a standard transformer of the same
+   size.** That alone rules out training it at any meaningful scale. The cause
+   is how it runs, not what it is: 125 small blocks executed one after
+   another, each with tiny matmuls, so the GPU sits almost idle.
+2. **The loss is high because the model has barely trained** (20M tokens; a
+   124M model normally sees 2–3B). It says little about the architecture either way.
+3. **No brain mechanism has shown a measurable gain yet.** Feedback sweeps,
+   inhibition, persistent state, gating and LNS each came out at about zero within
+   noise (docs 02, 05, 07).
+
+So a bigger v1 would not work: 10B parameters cannot even hold AdamW state on
+one 80 GB GPU (~160 GB needed), and at v1's speed it would see almost no data.
+What investors and labs accept as evidence for a new architecture is a
+**scaling curve**: loss against compute at several sizes, against a strong
+baseline trained identically. That is what this study produces.
+
+## What changed
+
+### The NaN in the adaptive run (fixed in both v1 and v2)
+Each thinking cycle added the alpha/beta interference on top of every block's
+residual output, so the state grew about **7× per cycle**: measured readout RMS
+was 0.2 → 1.7 → 11 → 80 → 713 → 4,877 → 32,781 → 220,854 over 8 cycles. At 4
+cycles in bf16 the gradients overflowed: grad_norm went 110 → 4e4 → 4e8 → 1e14
+→ inf at steps 1200–1400, and the loss was NaN from step 1600. Fix: between
+cycles the state is RMS-normalised and the original input re-injected (the
+recurrent-depth recipe). After the fix: 0.2 → 3.9 → 5.8 → 6.4 → 6.5 → 6.6 → 6.5
+→ 6.5, stable even at twice the trained loop count. Both trainers now also
+**skip** an update whose gradient norm is not finite, instead of writing NaN into
+every weight.
+
+### Raslila v2 (`src/raslila/grid.py`): same idea, GPU-shaped
+- A grid of transformer blocks `[layers, rows, cols]`, every block with its own
+  weights, lateral neighbours plus small-world long-range links, upward
+  messages, and downward feedback.
+- **All blocks of a sheet run together** as one batched matmul, and attention
+  for all of them is one flash-attention call. The sequential depth per sweep
+  is `layers × node_depth`, as in a normal transformer.
+- Blocks in a sheet update from the same snapshot (Jacobi). v1's in-sheet
+  sequential order bought ~0.026 nats at ~25× sequential cost.
+- Messages are linear maps of normalised neighbour states, **zero-initialised**,
+  so the model starts as clean parallel towers and learns how much to listen.
+- **Thinking loops**: cycle 1 = one bottom-up sweep; each further cycle = down
+  through the feedback links and back up, with re-normalisation and input
+  injection; an answer is read out after every cycle. Training samples 1..K
+  cycles and supervises every exit. At inference it stops once the prediction
+  is confident or has stopped changing.
+- Readout projects the whole deepest sheet (N × d_node) to the embedding width.
+- Activation checkpointing per sheet, so large grids fit in memory.
+
+### The baseline (`src/raslila/baseline.py`)
+A standard decoder-only transformer with the **same recipe**: RMSNorm
+pre-norm, RoPE, QK-norm, SwiGLU, tied embeddings, no dropout. It is the
+yardstick, not a second product. Raslila is only worth funding if it beats it.
+
+### Data (`configs/data.yaml`, `src/raslila/data_mix.py`)
+General knowledge + maths + code, interleaved by weight so every slice
+(including validation) has the same mix:
+
+| source | content | weight |
+|---|---|---|
+| HuggingFaceFW/fineweb-edu (sample-100BT) | educational web text | 60% |
+| wikimedia/wikipedia (20231101.en) | encyclopedia | 10% |
+| HuggingFaceTB/finemath (finemath-4plus) | step-by-step maths | 15% |
+| codeparrot/codeparrot-clean | deduplicated Python | 15% |
+
+32,768-token byte-level BPE with **one token per digit** (for maths), NFC,
+`<|pad|>`=0, `<|endoftext|>`=1. Junk, stubs and exact duplicates are dropped
+(with per-source thresholds; code and LaTeX are symbol-heavy). The 21B-token
+cache is streamed to disk incrementally (42 GB, low RAM).
+
+### The study configs (`configs/scaling/`)
+Pairs matched on parameters; everything else is identical (checked by
+`python run.py check`):
+
+| tier | baseline | Raslila v2 | tokens | est. A100-hours* (B / R) |
+|---|---|---|---|---|
+| 50m | 42.5M, d512 × 8 | 41.9M, grid 3×3×3, d192 | 1.0B | 1 / 2 |
+| 125m | 110.1M, d768 × 12 | 106.1M, grid 3×4×4, d256 | 2.5B | 4 / 10 |
+| 350m | 337.2M, d1024 × 24 | 325.4M, grid 5×4×4, d384 | 7.0B | 36 / 87 |
+| 1b | 977.9M, d2048 × 18 | 900.9M, grid 5×5×5, d512 | 20B | 281 / 642 |
+
+\*At an assumed 40% MFU. The real number comes from `python run.py speed`.
+Total ≈ 1,060 A100-hours ≈ **11 days on 4 A100s**, if Raslila v2 reaches the
+assumed efficiency. Raslila trains with 1–2 thinking cycles (≈2.4× the
+baseline's FLOPs per token), and the report plots **loss against FLOPs actually
+spent**, so the extra compute is counted against it.
+
+Shared recipe: seq 1024, 0.5M tokens per step, AdamW (0.9, 0.95), wd 0.1,
+cosine to 10% after a 2% warmup, grad clip 1.0, bf16, same seed, and the same
+validation windows for every model.
+
+## How to run it (4× A100)
+
+```bash
+python run.py setup                 # packages + GPUs
+python run.py check                 # configs are fair and build
+python run.py smoke                 # both models train (seconds, no data)
+python run.py data                  # corpus, once (hours; prints an ETA)
+python run.py speed --tier 125m     # FIRST GO/NO-GO (minutes)
+python run.py study                 # everything, scheduled over the 4 GPUs
+python run.py report                # table + runs/scaling.png + verdict
+```
+
+Run long commands inside `tmux`. Everything resumes automatically from
+`runs/<name>/ckpt.pt`, so after any interruption just run the same command again.
+Each run writes `runs/<name>/metrics.json` (params, tokens, FLOPs, tok/s, MFU,
+val-loss history, loss per thinking cycle) and `log.csv`.
+
+## Decision rules (fixed before seeing the results)
+
+1. **Speed gate (day 1).** `run.py speed`: if Raslila v2 runs at less than
+   ~1/4 of the baseline's tokens/s at equal parameters (beyond its intended
+   extra sweeps), optimise first (try `--compile`, larger micro-batches)
+   before spending study time.
+2. **Small-tier gate (~day 2–3).** After the 50m and 125m pairs: if Raslila's
+   loss at equal FLOPs is clearly worse at both sizes **and** the gap is not
+   shrinking, do not run 350m/1b as is. Change the design first.
+3. **Main result (~week 2–3).** With 3–4 sizes per family, the report fits
+   `loss = a·C^−b` and gives the **compute multiplier**: how much more compute
+   the baseline needs to match Raslila. A multiplier > 1 with an equal or
+   steeper slope is a result worth showing investors. Anything else is not, and
+   saying so early is better than burning the remaining budget.
+4. **Thinking loops.** The per-cycle validation loss shows whether a second
+   cycle helps. If cycle 2 is not better than cycle 1, the loops are not
+   earning their compute.
+
+## Honest limits
+- One seed per run. Differences under ~0.02 nats at a single size are noise;
+  trust the curve, not one point.
+- Learning rates follow GPT-3's per-size table and are shared by both families.
+  They are tuned for standard transformers, which slightly favours the baseline;
+  a short LR sweep for Raslila at 50m is cheap and worth doing if it is close.
+- The 10B+ number in the report is an **extrapolation** of the fitted curves,
+  labelled as such. It is how large runs are justified, but it is not a measurement.

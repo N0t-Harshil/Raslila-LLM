@@ -556,6 +556,7 @@ def main():
     window_loss = 0.0
     window_size = 0
     grad_norm = 0.0
+    skipped_steps = 0
     csv_path = None
     corpus = None
     val_corpus = None
@@ -776,7 +777,23 @@ def main():
                     model.parameters(), grad_clip)
             else:
                 grad_norm = torch.nn.utils.clip_grad_norm_(params, grad_clip)
-            if scaler is not None:
+            # A single inf/NaN gradient used to be clipped (inf * 0 = NaN) and
+            # written into every weight, after which the run was dead for good
+            # (the adaptive run: grad_norm inf at step 1400, loss NaN from 1600).
+            # Skip that update instead and keep training from intact weights.
+            if not torch.isfinite(torch.as_tensor(grad_norm)).item():
+                skipped_steps += 1
+                if is_main:
+                    print('  [skipped optimizer step {}: non-finite grad norm; {} skipped so far]'
+                          .format(step, skipped_steps))
+                if skipped_steps > 50:
+                    raise SystemExit('More than 50 non-finite gradient steps: the run has '
+                                     'diverged. Lower training.learning_rate and resume '
+                                     'from the last good checkpoint.')
+                optimizer.zero_grad(set_to_none=True)
+                if scaler is not None:
+                    scaler.update()
+            elif scaler is not None:
                 scaler.step(optimizer)
                 scaler.update()
             else:

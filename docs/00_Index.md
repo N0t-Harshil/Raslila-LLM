@@ -15,12 +15,15 @@ Original quantum research notes (15 files) are archived untouched in `../docs_or
 | [05 Scorecards](05_Scorecards.md) | Per-component 0–10 scores and the honest verdict |
 | [06 Known Limitations](06_Known_Limitations.md) | What doesn't work; what 5T would actually require |
 | [**07 Brain Gap Analysis**](07_Brain_Gap_Analysis.md) | **What a real brain has that Raslila doesn't — 13 gaps, bad analogies, a prioritised roadmap, and a measured "can it work like a brain?" check** |
-| [**08 Runbook**](08_Runbook_Bidirectional_Test.md) | **Commands for the current experiment: train A/B, compare, sample, then activate the next candidate one at a time** |
+| [**09 Scaling Study**](09_Scaling_Study.md) | **START HERE (2026-11).** Measured state of v1, the NaN fix, Raslila v2 (fast grid), the baseline, the general+math+code data, the 4-GPU study, and the decision rules |
+| [08 Runbook (v1, finished)](08_Runbook_Bidirectional_Test.md) | **Commands for the current experiment: train A/B, compare, sample, then activate the next candidate one at a time** |
 
 Legacy top-level docs are retained and still accurate in spirit: `../README.md`,
 `../PRE_TRAINING_DESIGN.md`, `../SOTA_COMPARISON.md`, `../VERIFICATION_REPORT.md`.
 
 ## Current state
+
+> **2026-11:** the v1 A/B below is finished (bidirectional sweeps: -0.009 nats at 2x compute, i.e. no gain) and the project has moved to the scaling study in [09](09_Scaling_Study.md). The table below describes v1.
 
 | | |
 |---|---|

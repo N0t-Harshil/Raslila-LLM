@@ -57,3 +57,8 @@ logs/
 # OS
 .DS_Store
 Thumbs.db
+# --- Scaling study (2026-11): generated, never commit ----------------
+# data/mix/ is rebuilt by `python run.py data` (42 GB token cache + tokenizer);
+# runs/ holds checkpoints and metrics of every training run.
+data/mix/
+runs/

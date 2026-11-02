@@ -1,5 +1,48 @@
 # Raslila: Brain-Inspired Deep-Grid Transformer
 
+## START HERE (2026-11): the scaling study
+
+The question that decides this project: **does the 3D brain grid beat a
+standard transformer when both are trained the same way, and does the gap hold
+as models grow?** Everything below "Raslila v1" is history; the current code
+path is:
+
+| piece | file |
+|---|---|
+| Raslila v2: grid `[layers, rows, cols]`, lateral + feedback messages, thinking loops with early exit, batched for GPUs | `src/raslila/grid.py` |
+| Standard transformer baseline, same recipe (the yardstick) | `src/raslila/baseline.py` |
+| General knowledge + maths + code corpus (FineWeb-Edu, Wikipedia, FineMath, Python) | `configs/data.yaml`, `src/raslila/data_mix.py` |
+| Matched pairs at 50M / 125M / 350M / 1B | `configs/scaling/` |
+| Trainer (1 GPU or DDP), speed test, report | `scripts/train_scaling.py`, `speed_test.py`, `scaling_report.py` |
+
+```bash
+python run.py setup          # packages + GPUs
+python run.py check          # configs are fair and build
+python run.py smoke          # both models train (seconds, no data needed)
+python run.py data           # build the corpus once (hours; prints ETA)
+python run.py speed          # first go/no-go: Raslila vs baseline tokens/s
+python run.py study          # every size of both models, scheduled on all GPUs
+python run.py report         # table, runs/scaling.png, compute multiplier
+python run.py generate --run raslila_125m --prompt "def add(a, b):"
+python run.py live --run raslila_125m      # always-on chat, input mid-answer
+```
+
+**Why (measured on the A100):** v1 trained at ~1,000 tokens/s, about 150-200x
+slower than a standard transformer of its size, saw only 20.5M tokens in 5.6 h
+(val loss 5.46), and none of its brain mechanisms has yet shown a measurable
+gain (bidirectional sweeps: -0.009 nats at 2x compute). The adaptive run went to
+NaN because the state grew ~7x per thinking cycle; that is fixed. A 10B model
+cannot be trained on one 80 GB GPU (AdamW state alone is ~160 GB), and a big
+model trained on too little data loses to a small one trained properly. The
+evidence that justifies a big run is a scaling curve, which this study
+produces in ~2-3 weeks on 4x A100. Full plan, numbers and decision rules:
+[`docs/09_Scaling_Study.md`](docs/09_Scaling_Study.md). Old v1 commands:
+`python run.py legacy <command>`.
+
+---
+
+# Raslila v1 (history)
+
 > Original quantum research notes (15 files) are preserved untouched in `docs_original/`.
 > Raslila has since evolved from a 6-qubit quantum proof-of-concept into a
 > **purely classical, brain-inspired deep grid** with edge networks that compute,

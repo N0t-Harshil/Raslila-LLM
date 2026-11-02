@@ -53,6 +53,19 @@ EOS = '<|endoftext|>'
 
 
 def load_model(args):
+    ckpt = torch.load(args.checkpoint, map_location='cpu', weights_only=False)
+    if 'model_config' in ckpt:
+        # Scaling-study run (Raslila v2 grid or baseline): runs/<name>/ckpt.pt
+        sys.path.insert(0, os.path.join(_ROOT, 'scripts'))
+        from train_scaling import build_model
+        model = build_model(ckpt['model_config'])
+        model.load_state_dict(ckpt['model'])
+        model.eval()
+        if not hasattr(model.config, 'max_think_cycles'):
+            model.config.max_think_cycles = 0      # baseline: fixed depth
+            model.config.depth_sweeps = 1
+        window = int(args.window or ckpt.get('train_config', {}).get('seq_len', 1024))
+        return model, window
     with open(args.config, 'r', encoding='utf-8') as f:
         raw = yaml.safe_load(f)
     b3 = dict(raw['raslila'])
