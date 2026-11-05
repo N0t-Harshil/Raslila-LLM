@@ -150,8 +150,21 @@ def main():
 
     micro = int(args.micro_batch or tr['micro_batch'])
     batch_tokens = int(float(tr['batch_tokens']))
-    accum = max(1, round(batch_tokens / (micro * seq_len * world)))
+    # Tokens per optimizer step must be IDENTICAL for both families, whatever
+    # their micro-batch and however many GPUs. 0.5M is exact on 1/2/4/8 GPUs;
+    # on e.g. 3 GPUs it is rounded to a multiple of 32 sequences per GPU, the
+    # same for every micro-batch that divides 32 (all study configs do).
+    GRAIN = 32
+    if GRAIN % micro == 0:
+        rows = max(1, round(batch_tokens / (seq_len * world * GRAIN))) * GRAIN
+        accum = rows // micro
+    else:
+        accum = max(1, round(batch_tokens / (micro * seq_len * world)))
     eff_batch_tokens = accum * micro * seq_len * world
+    if eff_batch_tokens != batch_tokens and rank == 0:
+        print('NOTE: {:,} tokens per step on {} GPU(s) (config asks {:,}); identical for every '
+              'model trained on this many GPUs. Do not change the GPU count mid-run.'.format(
+                  eff_batch_tokens, world, batch_tokens))
     budget = int(float(tr['tokens'])) if 'tokens' in tr else int(float(tr.get('tokens_per_param', 20)) * total_params)
     steps = max(1, budget // eff_batch_tokens)
     if args.max_steps:
