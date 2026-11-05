@@ -13,7 +13,7 @@ path is:
 | Standard transformer baseline, same recipe (the yardstick) | `src/raslila/baseline.py` |
 | General knowledge + maths + code corpus (FineWeb-Edu, Wikipedia, FineMath, Python) | `configs/data.yaml`, `src/raslila/data_mix.py` |
 | Matched pairs at 50M / 125M / 350M / 1B | `configs/scaling/` |
-| Trainer (1 GPU or DDP), speed test, report | `scripts/train_scaling.py`, `speed_test.py`, `scaling_report.py` |
+| Trainer (1 GPU or DDP), speed test, report, benchmarks | `scripts/train_scaling.py`, `speed_test.py`, `scaling_report.py`, `benchmark.py` |
 
 ```bash
 python run.py setup          # packages + GPUs
@@ -21,8 +21,10 @@ python run.py check          # configs are fair and build
 python run.py smoke          # both models train (seconds, no data needed)
 python run.py data           # build the corpus once (hours; prints ETA)
 python run.py speed          # first go/no-go: Raslila vs baseline tokens/s
-python run.py study          # every size of both models, scheduled on all GPUs
-python run.py report         # table, runs/scaling.png, compute multiplier
+python run.py study          # every model one after another on all GPUs; benchmarks each
+python run.py status         # progress / val loss / ETA of every model
+python run.py report         # compare every model: runs/scaling_report.md, compare.csv, plots
+python run.py bench --all    # benchmarks (HellaSwag, ARC, GSM8K, HumanEval, ...) on demand
 python run.py generate --run raslila_125m --prompt "def add(a, b):"
 python run.py live --run raslila_125m      # always-on chat, input mid-answer
 ```

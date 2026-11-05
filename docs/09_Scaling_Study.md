@@ -117,14 +117,54 @@ python run.py check                 # configs are fair and build
 python run.py smoke                 # both models train (seconds, no data)
 python run.py data                  # corpus, once (hours; prints an ETA)
 python run.py speed --tier 125m     # FIRST GO/NO-GO (minutes)
-python run.py study                 # everything, scheduled over the 4 GPUs
-python run.py report                # table + runs/scaling.png + verdict
+python run.py study                 # every model, one after another, on all 4 GPUs
+python run.py status                # anytime: progress / val loss / ETA per model
+python run.py report                # the comparison of every model (also run automatically)
 ```
 
+`study` trains the models **one after another, each on all GPUs**:
+baseline_50m → raslila_50m → baseline_125m → raslila_125m → … → raslila_1b.
+After each model it **benchmarks** it and **refreshes the comparison**, so a
+same-size head-to-head exists as soon as each pair is done. Options:
+`--no-bench`, `--quick` (300 examples per task), `--run-code` (adds HumanEval
+pass@1, which executes model-written Python), `--tiers 50m,125m`.
+
 Run long commands inside `tmux`. Everything resumes automatically from
-`runs/<name>/ckpt.pt`, so after any interruption just run the same command again.
-Each run writes `runs/<name>/metrics.json` (params, tokens, FLOPs, tok/s, MFU,
-val-loss history, loss per thinking cycle) and `log.csv`.
+`runs/<name>/ckpt.pt` (and finished models/benchmarks are skipped), so after
+any interruption just run the same command again.
+
+### What gets logged (nothing is overwritten)
+| file | contents |
+|---|---|
+| `logs/study.log` | timeline of the whole study: start / done / failed, final val loss, benchmark scores |
+| `runs/<name>/train.log` | full training output of that model, appended across resumes |
+| `runs/<name>/log.csv` | loss, lr, grad norm, tok/s, MFU every 10 steps; val loss every 250 |
+| `runs/<name>/metrics.json` | params, tokens, FLOPs, speed, MFU, val-loss history, loss per thinking cycle |
+| `runs/<name>/benchmark.json` (+ `benchmark.log`) | every benchmark score, per thinking cycle, sample outputs |
+| `logs/<command>_<time>.log` | a copy of every command's output |
+
+### The comparison (`runs/`, rebuilt after every model)
+- `scaling_report.md`: training table, benchmark table (the better model at each size in bold, chance level shown), head-to-head per size (val-loss difference, speed ratio, benchmarks won/lost), the thinking-loop table (cycle 1 → 2 on val loss and on every benchmark), and the scaling fit with its 10B projection.
+- `compare.csv`: one row per model with every number.
+- `scaling.png`: loss vs compute. `curves.png`: val loss during training, every model overlaid. `benchmarks.png`: every benchmark, every model side by side.
+
+### Benchmarks (`python run.py bench --run NAME` or `--all`)
+Zero-shot log-likelihood scoring, as lm-evaluation-harness does it, so the
+numbers are comparable to published small models:
+
+| area | tasks |
+|---|---|
+| general knowledge / reasoning | HellaSwag, ARC-Easy, ARC-Challenge, SciQ, OpenBookQA, Winogrande, LAMBADA |
+| maths | GSM8K bits-per-byte on worked solutions; GSM8K 3-shot exact answer (250 problems) |
+| code | HumanEval bits-per-byte on reference solutions; HumanEval pass@1 (with `--run-code`) |
+| language modelling | WikiText-2 bits per byte |
+
+Expect small models to sit near chance on ARC-Challenge, Winogrande and
+OpenBookQA, and at ~0–3% on GSM8K and HumanEval. That is normal below 1B and
+~20B tokens. The bits-per-byte numbers are the sensitive ones at this scale. What
+counts is Raslila vs the baseline at the same size, and how the gap moves
+with size. A full benchmark takes minutes for 50m and roughly an hour for 1b
+on one GPU.
 
 ## Decision rules (fixed before seeing the results)
 

@@ -8,9 +8,19 @@ THE PLAN (scaling study: does the 3D brain grid beat a standard transformer?)
     3. python run.py smoke            seconds-long runs of both models (no data needed)
     4. python run.py data             build the general+math+code corpus (once, cached)
     5. python run.py speed            FIRST GO/NO-GO: Raslila vs baseline tokens/s on your GPU
-    6. python run.py study            train every size of both models on all GPUs
-                                      (50M, 125M, 350M pairs one per GPU, then 1B on all 4)
-    7. python run.py report           table + scaling plot + head-to-head verdict
+    6. python run.py study            train every model ONE AFTER ANOTHER, each on all GPUs:
+                                      baseline_50m, raslila_50m, baseline_125m, ... raslila_1b.
+                                      After each model: benchmark it + refresh the comparison.
+    7. python run.py report           comparison of every model: training, benchmarks,
+                                      thinking loops, scaling fit (runs/scaling_report.md)
+
+WATCHING / COMPARING
+    python run.py status              one line per model: progress, val loss, ETA
+    python run.py compare             same as report
+    python run.py bench --run raslila_125m      benchmark one model (or --all)
+    logs/study.log                    timeline of the whole study (start/done/scores)
+    runs/<name>/train.log             full training output of that model (kept across resumes)
+    runs/<name>/log.csv, metrics.json, benchmark.json   every number of that model
 
 SINGLE RUNS / USING A MODEL
     python run.py scale --tier 125m --family raslila [--gpus 4]   one training run
@@ -47,11 +57,17 @@ def log_path(name):
         name, datetime.datetime.now().strftime('%Y%m%d_%H%M%S')))
 
 
-def run(cmd, name, env=None):
-    """Run a command, streaming output to the console AND a log file."""
+def run(cmd, name, env=None, also_log=None):
+    """Run a command, streaming output to the console AND a log file
+    (and, if given, appending it to `also_log` too)."""
     path = log_path(name)
     print('>>> ' + ' '.join(cmd) + '\n    (log: {})'.format(os.path.relpath(path, ROOT)), flush=True)
     full_env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8', **(env or {}))
+    extra = None
+    if also_log:
+        os.makedirs(os.path.dirname(also_log), exist_ok=True)
+        extra = open(also_log, 'a', encoding='utf-8')
+        extra.write('\n##### {} | {}\n'.format(time.strftime('%Y-%m-%d %H:%M:%S'), ' '.join(cmd)))
     with open(path, 'w', encoding='utf-8') as log:
         proc = subprocess.Popen(cmd, cwd=ROOT, env=full_env, stdout=subprocess.PIPE,
                                 stderr=subprocess.STDOUT, text=True, encoding='utf-8',
@@ -60,12 +76,18 @@ def run(cmd, name, env=None):
             for line in proc.stdout:
                 sys.stdout.write(line)
                 log.write(line)
+                if extra:
+                    extra.write(line)
+                    extra.flush()
             proc.wait()
         except KeyboardInterrupt:
             proc.terminate()
             proc.wait()
             print('\n[interrupted -- run the same command again to resume]')
             return 130
+        finally:
+            if extra:
+                extra.close()
     if proc.returncode:
         print('\n[{} exited with code {}; see {}]'.format(name, proc.returncode, os.path.relpath(path, ROOT)))
     return proc.returncode
@@ -192,92 +214,142 @@ def cmd_scale(a):
     return 0
 
 
+STUDY_LOG = os.path.join(ROOT, 'logs', 'study.log')
+
+
+def study_log(msg):
+    """One line in logs/study.log (appended, never overwritten) and on screen."""
+    os.makedirs(os.path.dirname(STUDY_LOG), exist_ok=True)
+    line = '[{}] {}'.format(time.strftime('%Y-%m-%d %H:%M'), msg)
+    print(line, flush=True)
+    with open(STUDY_LOG, 'a', encoding='utf-8') as f:
+        f.write(line + '\n')
+
+
+def bench_summary(name):
+    path = os.path.join(ROOT, 'runs', name, 'benchmark.json')
+    if not os.path.exists(path):
+        return ''
+    with open(path, 'r', encoding='utf-8') as f:
+        tasks = json.load(f).get('tasks', {})
+    return ', '.join('{} {:.3f}'.format(t, v['value']) for t, v in tasks.items())
+
+
+def bench_cmd(runs, a):
+    cmd = [PY, 'scripts/benchmark.py']
+    for r in runs:
+        cmd += ['--run', r]
+    if getattr(a, 'quick', False):
+        cmd.append('--quick')
+    if getattr(a, 'run_code', False):
+        cmd.append('--run-code')
+    if getattr(a, 'think', None):
+        cmd += ['--think', str(a.think)]
+    if getattr(a, 'tasks', None):
+        cmd += ['--tasks', a.tasks]
+    if getattr(a, 'force', False):
+        cmd.append('--force')
+    return cmd
+
+
 def cmd_study(a):
-    """Schedule the whole study over the GPUs. Small tiers: one run per GPU in
-    parallel. Tiers in --multi-gpu-tiers: one run at a time on all GPUs."""
+    """Train every model one after another, each on ALL GPUs (DDP).
+    Order: baseline then Raslila at each size, smallest size first, so a
+    fair same-size comparison is available as early as possible. After every
+    model: benchmark it and refresh the comparison report."""
     gpus = a.gpus or n_gpus()
     if gpus < 1:
         sys.exit('No GPUs visible.')
     tiers = [t for t in TIERS if t in a.tiers.split(',')]
-    multi = set(a.multi_gpu_tiers.split(',')) if gpus > 1 else set()
-    single = [(f, t) for t in tiers if t not in multi for f in FAMILIES]
-    big = [(f, t) for t in tiers if t in multi for f in FAMILIES]
-    todo = []
-    for f, t in single + big:
-        st = run_status('{}_{}'.format(f, t))
-        if st and st.get('finished'):
-            print('done already: {}_{} (val {:.4f})'.format(f, t, st['val_loss']))
-        else:
-            todo.append((f, t))
-    banner('Study on {} GPU(s): {}'.format(gpus, ', '.join('{}_{}'.format(f, t) for f, t in todo) or 'nothing to do'))
+    order = [(f, t) for t in tiers for f in ('baseline', 'raslila')]
+    names = ['{}_{}'.format(f, t) for f, t in order]
+    banner('Study: {} models, one after another, each on {} GPU(s)\n  {}'.format(
+        len(order), gpus, ' -> '.join(names)))
+    study_log('STUDY START on {} GPU(s): {}'.format(gpus, ' -> '.join(names)))
     extra = ['--compile'] if a.compile else []
-
-    def launch(fam, tier, devices):
-        cfg = 'configs/scaling/{}_{}.yaml'.format(fam, tier)
-        path = log_path('study_{}_{}'.format(fam, tier))
-        env = dict(os.environ, PYTHONUNBUFFERED='1', PYTHONIOENCODING='utf-8',
-                   CUDA_VISIBLE_DEVICES=','.join(map(str, devices)))
-        f = open(path, 'w', encoding='utf-8')
-        p = subprocess.Popen(train_cmd(cfg, len(devices), extra), cwd=ROOT, env=env,
-                             stdout=f, stderr=subprocess.STDOUT)
-        print('[{}] START {}_{} on GPU {} -> {}'.format(time.strftime('%H:%M'), fam, tier,
-                                                        ','.join(map(str, devices)), os.path.relpath(path, ROOT)),
-              flush=True)
-        return p, f, path
-
-    def tail(path):
-        try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                lines = [l.strip() for l in f.readlines()[-30:] if l.startswith('step')]
-            return lines[-1] if lines else ''
-        except OSError:
-            return ''
-
     failed = []
-    queue = [j for j in todo if j[1] not in multi]
-    running = {}                                   # gpu -> (job, proc, file, path)
-    last_report = time.time()
-    try:
-        while queue or running:
-            for g in range(gpus):
-                if g not in running and queue:
-                    job = queue.pop(0)
-                    running[g] = (job,) + launch(job[0], job[1], [g])
-            time.sleep(20)
-            for g, (job, p, f, path) in list(running.items()):
-                if p.poll() is not None:
-                    f.close()
-                    del running[g]
-                    if p.returncode:
-                        failed.append(job)
-                        print('[{}] FAILED {}_{} (exit {}), see {}'.format(
-                            time.strftime('%H:%M'), job[0], job[1], p.returncode, os.path.relpath(path, ROOT)))
-                    else:
-                        st = run_status('{}_{}'.format(*job)) or {}
-                        print('[{}] DONE {}_{}: val loss {}'.format(time.strftime('%H:%M'), job[0], job[1],
-                                                                  st.get('val_loss')), flush=True)
-            if time.time() - last_report > 600 and running:
-                last_report = time.time()
-                for g, (job, _, _, path) in running.items():
-                    print('  GPU {} {}_{}: {}'.format(g, job[0], job[1], tail(path)), flush=True)
-        for job in [j for j in todo if j[1] in multi]:
-            p, f, path = launch(job[0], job[1], list(range(gpus)))
-            while p.poll() is None:
-                time.sleep(600)
-                print('  {}_{}: {}'.format(job[0], job[1], tail(path)), flush=True)
-            f.close()
-            if p.returncode:
-                failed.append(job)
-                print('FAILED {}_{}, see {}'.format(job[0], job[1], os.path.relpath(path, ROOT)))
-            else:
-                print('DONE {}_{}: val loss {}'.format(job[0], job[1], (run_status('{}_{}'.format(*job)) or {}).get('val_loss')))
-    except KeyboardInterrupt:
-        print('\nStopping all runs (they resume from their last checkpoint when you re-run `study`).')
-        for job, p, f, _ in running.values():
-            p.terminate()
-        return 130
-    cmd_report(a)
+    for n, (fam, tier) in enumerate(order, 1):
+        name = '{}_{}'.format(fam, tier)
+        st = run_status(name)
+        if st and st.get('finished'):
+            print('[{}/{}] {} already trained (val loss {:.4f})'.format(n, len(order), name, st['val_loss']))
+        else:
+            cfg = 'configs/scaling/{}.yaml'.format(name)
+            banner('[{}/{}] TRAINING {} on {} GPU(s)'.format(n, len(order), name, gpus))
+            study_log('START {} ({}/{})'.format(name, n, len(order)))
+            t0 = time.time()
+            rc = run(train_cmd(cfg, gpus, extra), 'train_' + name,
+                     also_log=os.path.join(ROOT, 'runs', name, 'train.log'))
+            if rc == 130:
+                study_log('STOPPED by user during {} (re-run `python run.py study` to resume)'.format(name))
+                return 130
+            st = run_status(name) or {}
+            if rc or not st.get('finished'):
+                failed.append(name)
+                study_log('FAILED {} (exit {}) after {:.1f}h -- see runs/{}/train.log; moving on'.format(
+                    name, rc, (time.time() - t0) / 3600, name))
+                continue
+            study_log('DONE {}: val loss {:.4f} | {:.0f}M params | {:.2f}B tokens | {:,.0f} tok/s | {:.1f}h'.format(
+                name, st['val_loss'], st['params_total'] / 1e6, st['tokens_seen'] / 1e9,
+                st['tokens_per_second'], (time.time() - t0) / 3600))
+        if not a.no_bench:
+            banner('[{}/{}] BENCHMARK {}'.format(n, len(order), name))
+            rc = run(bench_cmd([name], a), 'bench_' + name,
+                     also_log=os.path.join(ROOT, 'runs', name, 'benchmark.log'))
+            if rc == 130:
+                return 130
+            study_log(('BENCH {}: {}' if not rc else 'BENCH {} had errors: {}').format(name, bench_summary(name)))
+        run([PY, 'scripts/scaling_report.py'], 'report')
+        study_log('comparison updated: runs/scaling_report.md')
+    study_log('STUDY END. failed: {}'.format(', '.join(failed) or 'none'))
     return 1 if failed else 0
+
+
+def cmd_bench(a):
+    if not a.run and not a.all:
+        sys.exit('Give --run NAME (repeatable) or --all.')
+    runs = list(a.run or [])
+    if a.all:
+        import glob
+        runs += sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(ROOT, 'runs', '*', 'ckpt.pt'))
+                       if not os.path.basename(os.path.dirname(p)).startswith('smoke'))
+    banner('Benchmark: ' + ', '.join(runs))
+    rc = 0
+    for r in dict.fromkeys(runs):
+        rc = run(bench_cmd([r], a), 'bench_' + r, also_log=os.path.join(ROOT, 'runs', r, 'benchmark.log')) or rc
+        if rc == 130:
+            return rc
+        study_log('BENCH {}: {}'.format(r, bench_summary(r)))
+    run([PY, 'scripts/scaling_report.py'], 'report')
+    return rc
+
+
+def cmd_status(a):
+    banner('Status of every model (runs/)')
+    print('{:<16} {:>9} {:>13} {:>9} {:>11} {:>8}  {}'.format(
+        'model', 'params', 'progress', 'val loss', 'tok/s', 'ETA', 'benchmarks'))
+    for t in TIERS:
+        for f in ('baseline', 'raslila'):
+            name = '{}_{}'.format(f, t)
+            st = run_status(name)
+            if not st:
+                print('{:<16} {:>9}'.format(name, 'not started'))
+                continue
+            done, total = st.get('steps_done', 0), max(1, st.get('steps_total', 1))
+            eta = '' if st.get('finished') else '{:.1f}h'.format(
+                (total - done) * st['train_seconds'] / max(1, done) / 3600)
+            val = st.get('val_loss')
+            print('{:<16} {:>8.0f}M {:>12} {:>9} {:>11,.0f} {:>8}  {}'.format(
+                name, st['params_total'] / 1e6,
+                'finished' if st.get('finished') else '{:.0%} ({}/{})'.format(done / total, done, total),
+                '{:.4f}'.format(val) if val else '-', st['tokens_per_second'], eta,
+                'yes' if os.path.exists(os.path.join(ROOT, 'runs', name, 'benchmark.json')) else '-'))
+    if os.path.exists(STUDY_LOG):
+        with open(STUDY_LOG, 'r', encoding='utf-8') as f:
+            tail = f.readlines()[-8:]
+        print('\nlast lines of logs/study.log:\n' + ''.join('  ' + l for l in tail).rstrip())
+    print('\nFull comparison: python run.py report  ->  runs/scaling_report.md')
+    return 0
 
 
 def cmd_report(a):
@@ -334,12 +406,25 @@ def main():
     p.add_argument('--gpus', type=int, default=1)
     p.add_argument('--micro-batch', type=int, default=None)
     p.add_argument('--compile', action='store_true')
-    p = add('study', cmd_study, 'train every tier of both families across all GPUs')
+    p = add('study', cmd_study, 'train every model one after another (each on all GPUs), '
+                                'benchmark each, keep the comparison up to date')
     p.add_argument('--gpus', type=int, default=None, help='default: all visible')
     p.add_argument('--tiers', default='50m,125m,350m,1b')
-    p.add_argument('--multi-gpu-tiers', default='1b', help='tiers trained on all GPUs at once')
     p.add_argument('--compile', action='store_true')
-    add('report', cmd_report, 'scaling table, plot and verdict from finished runs')
+    p.add_argument('--no-bench', action='store_true', help='skip benchmarking after each model')
+    p.add_argument('--quick', action='store_true', help='quick benchmarks (300 examples per task)')
+    p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
+    p = add('bench', cmd_bench, 'benchmark trained models (general, math, code)')
+    p.add_argument('--run', action='append', help='e.g. raslila_125m (repeatable)')
+    p.add_argument('--all', action='store_true', help='every model with a checkpoint')
+    p.add_argument('--quick', action='store_true', help='300 examples per task')
+    p.add_argument('--tasks', default=None, help='comma list, e.g. hellaswag,gsm8k')
+    p.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila')
+    p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
+    p.add_argument('--force', action='store_true', help='re-score even if cached')
+    add('status', cmd_status, 'one line per model: progress, val loss, ETA')
+    add('report', cmd_report, 'compare every model: training, benchmarks, loops, scaling fit')
+    add('compare', cmd_report, 'same as report')
     p = add('generate', cmd_generate, 'sample text from a trained run')
     p.add_argument('--run', required=True, help='e.g. raslila_125m (a folder in runs/)')
     p.add_argument('--prompt', default='The most important idea in science is')
