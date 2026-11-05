@@ -2,6 +2,8 @@
 
 ## START HERE (2026-11): the scaling study
 
+**Every command, in order: [COMMANDS.md](COMMANDS.md).** Fresh fast environment: `bash scripts/make_env.sh`.
+
 The question that decides this project: **does the 3D brain grid beat a
 standard transformer when both are trained the same way, and does the gap hold
 as models grow?** Everything below "Raslila v1" is history; the current code

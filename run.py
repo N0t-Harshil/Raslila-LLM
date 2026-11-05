@@ -197,7 +197,28 @@ def cmd_speed(a):
     cmd = [PY, 'scripts/speed_test.py', '--tier', a.tier]
     if a.compile:
         cmd.append('--compile')
-    return run(cmd, 'speed_' + a.tier)
+    return run(cmd, 'speed_' + a.tier + ('_compile' if a.compile else ''))
+
+
+def cmd_gpucheck(a):
+    """Two-minute check that multi-GPU training (DDP), and torch.compile if
+    asked, work on this machine before committing days to `study`."""
+    gpus = a.gpus or n_gpus()
+    extra = ['--synthetic', '--max-steps', '12', '--fresh']
+    if a.compile:
+        extra.append('--compile')
+    if a.no_ckpt:
+        extra.append('--no-ckpt')
+    for fam in FAMILIES:
+        banner('GPU check: {} {} on {} GPU(s){}, 12 steps of random tokens'.format(
+            fam, a.tier, gpus, ' + compile' if a.compile else ''))
+        rc = run(train_cmd('configs/scaling/{}_{}.yaml'.format(fam, a.tier), gpus,
+                           extra + ['--out-dir', 'runs/gpucheck_{}'.format(fam)]), 'gpucheck_' + fam)
+        if rc:
+            print('\nGPU check FAILED for {} -- paste the output above.'.format(fam))
+            return rc
+    print('\nGPU check OK: training works on {} GPU(s){}.'.format(gpus, ' with --compile' if a.compile else ''))
+    return 0
 
 
 def cmd_scale(a):
@@ -206,6 +227,8 @@ def cmd_scale(a):
         cfg = 'configs/scaling/{}_{}.yaml'.format(fam, a.tier)
         banner('Training {} on {} GPU(s)'.format(cfg, a.gpus))
         extra = ['--compile'] if a.compile else []
+        if a.no_ckpt:
+            extra.append('--no-ckpt')
         if a.micro_batch:
             extra += ['--micro-batch', str(a.micro_batch)]
         rc = run(train_cmd(cfg, a.gpus, extra), 'train_{}_{}'.format(fam, a.tier))
@@ -265,8 +288,9 @@ def cmd_study(a):
     names = ['{}_{}'.format(f, t) for f, t in order]
     banner('Study: {} models, one after another, each on {} GPU(s)\n  {}'.format(
         len(order), gpus, ' -> '.join(names)))
-    study_log('STUDY START on {} GPU(s): {}'.format(gpus, ' -> '.join(names)))
-    extra = ['--compile'] if a.compile else []
+    extra = (['--compile'] if a.compile else []) + (['--no-ckpt'] if a.no_ckpt else [])
+    study_log('STUDY START on {} GPU(s){}: {}'.format(gpus, ' ' + ' '.join(extra) if extra else '',
+                                                     ' -> '.join(names)))
     failed = []
     for n, (fam, tier) in enumerate(order, 1):
         name = '{}_{}'.format(fam, tier)
@@ -406,11 +430,13 @@ def main():
     p.add_argument('--gpus', type=int, default=1)
     p.add_argument('--micro-batch', type=int, default=None)
     p.add_argument('--compile', action='store_true')
+    p.add_argument('--no-ckpt', action='store_true', help='no activation checkpointing (faster if it fits)')
     p = add('study', cmd_study, 'train every model one after another (each on all GPUs), '
                                 'benchmark each, keep the comparison up to date')
     p.add_argument('--gpus', type=int, default=None, help='default: all visible')
     p.add_argument('--tiers', default='50m,125m,350m,1b')
     p.add_argument('--compile', action='store_true')
+    p.add_argument('--no-ckpt', action='store_true', help='no activation checkpointing (faster if it fits)')
     p.add_argument('--no-bench', action='store_true', help='skip benchmarking after each model')
     p.add_argument('--quick', action='store_true', help='quick benchmarks (300 examples per task)')
     p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
@@ -422,6 +448,11 @@ def main():
     p.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila')
     p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
     p.add_argument('--force', action='store_true', help='re-score even if cached')
+    p = add('gpucheck', cmd_gpucheck, '2-minute check that multi-GPU (+ compile) training works')
+    p.add_argument('--tier', default='125m', choices=TIERS)
+    p.add_argument('--gpus', type=int, default=None)
+    p.add_argument('--compile', action='store_true')
+    p.add_argument('--no-ckpt', action='store_true')
     add('status', cmd_status, 'one line per model: progress, val loss, ETA')
     add('report', cmd_report, 'compare every model: training, benchmarks, loops, scaling fit')
     add('compare', cmd_report, 'same as report')

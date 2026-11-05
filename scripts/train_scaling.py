@@ -84,9 +84,13 @@ def main():
     ap.add_argument('--micro-batch', type=int, default=None, help='override train.micro_batch')
     ap.add_argument('--compile', action='store_true', help='torch.compile the model')
     ap.add_argument('--fresh', action='store_true', help='ignore an existing checkpoint')
+    ap.add_argument('--no-ckpt', action='store_true',
+                    help='disable activation checkpointing (faster, more memory; same results)')
     args = ap.parse_args()
 
     cfg = load_config(args.config)
+    if args.no_ckpt:
+        cfg['model']['activation_checkpoint'] = False
     tr = cfg['train']
     out_dir = args.out_dir or cfg.get('out_dir') or os.path.join(
         'runs', os.path.splitext(os.path.basename(args.config))[0])

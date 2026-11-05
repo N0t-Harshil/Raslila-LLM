@@ -85,6 +85,8 @@ def main():
     ap.add_argument('--seq', type=int, default=None)
     ap.add_argument('--compile', action='store_true')
     ap.add_argument('--no-search', action='store_true', help='use the config micro_batch only')
+    ap.add_argument('--ckpt', default='both', choices=['both', 'on', 'off', 'config'],
+                    help='activation checkpointing for Raslila (default: time both)')
     args = ap.parse_args()
     configs = args.configs or ['configs/scaling/baseline_{}.yaml'.format(args.tier),
                                'configs/scaling/raslila_{}.yaml'.format(args.tier)]
@@ -99,7 +101,16 @@ def main():
         cyc_list = [None]
         if m['family'] == 'raslila' and int(m.get('max_think_cycles', 0)) > 0:
             cyc_list = list(range(1, int(m['max_think_cycles']) + 1))
-        for cycles in cyc_list:
+        # Raslila: also time it WITHOUT activation checkpointing (no recompute
+        # in backward: faster if it fits). Baseline configs run without it.
+        ck_list = [bool(m.get('activation_checkpoint', m['family'] == 'raslila'))]
+        if m['family'] == 'raslila' and args.ckpt == 'both':
+            ck_list = [True, False]
+        elif args.ckpt in ('on', 'off'):
+            ck_list = [args.ckpt == 'on']
+        base_m = m
+        for cycles, ck in [(c, k) for k in ck_list for c in cyc_list]:
+            m = dict(base_m, activation_checkpoint=ck)
             micro, best = int(tr['micro_batch']), None
             while True:
                 try:
@@ -118,10 +129,11 @@ def main():
             if best is None:
                 print('{}: does not fit even at micro_batch 1'.format(path))
                 continue
-            best.update(config=path, family=m['family'], cycles=cycles, seq=seq)
+            best.update(config=path, family=m['family'], cycles=cycles, seq=seq, ckpt=ck,
+                        compile=args.compile)
             rows.append(best)
-            print('{:<40} cycles {:<4} micro {:>3} | {:>9,.0f} tok/s | MFU {} | mem {} | {:.1f}M params'.format(
-                path, str(cycles or '-'), best['micro'], best['tok_s'],
+            print('{:<40} cycles {:<4} ckpt {:<3} micro {:>3} | {:>9,.0f} tok/s | MFU {} | mem {} | {:.1f}M params'.format(
+                path, str(cycles or '-'), 'on' if ck else 'off', best['micro'], best['tok_s'],
                 '{:.1%}'.format(best['mfu']) if best['mfu'] else 'n/a',
                 '{:.1f} GB'.format(best['mem_gb']) if best['mem_gb'] else 'n/a', best['params'] / 1e6))
     base = [r for r in rows if r['family'] == 'baseline']
@@ -129,12 +141,25 @@ def main():
         b = base[0]['tok_s']
         print('\nRelative to the baseline (tokens/s, same tier):')
         for r in rows:
-            print('  {:<40} cycles {:<4} {:>6.2f}x slower'.format(
-                r['config'], str(r['cycles'] or '-'), b / r['tok_s']))
+            print('  {:<40} cycles {:<4} ckpt {:<3} {:>6.2f}x slower'.format(
+                r['config'], str(r['cycles'] or '-'), 'on' if r['ckpt'] else 'off', b / r['tok_s']))
+        ras = [r for r in rows if r['family'] == 'raslila']
+        if len(set(r['ckpt'] for r in ras)) > 1:
+            print('\nRaslila with activation checkpointing OFF vs ON (same cycles):')
+            for c in sorted(set(r['cycles'] for r in ras)):
+                on = [r for r in ras if r['cycles'] == c and r['ckpt']]
+                off = [r for r in ras if r['cycles'] == c and not r['ckpt']]
+                if on and off:
+                    print('  cycles {}: {:.2f}x {} without it (micro {} vs {}, {:.0f} GB)'.format(
+                        c, off[0]['tok_s'] / on[0]['tok_s'],
+                        'faster' if off[0]['tok_s'] > on[0]['tok_s'] else 'speed',
+                        off[0]['micro'], on[0]['micro'], off[0]['mem_gb'] or 0))
+            print('  If it is faster: add --no-ckpt to `python run.py study` (same results, more memory).')
     os.makedirs('runs', exist_ok=True)
-    with open('runs/speed_test.json', 'w', encoding='utf-8') as f:
+    name = 'runs/speed_test_{}{}.json'.format(args.tier, '_compile' if args.compile else '')
+    with open(name, 'w', encoding='utf-8') as f:
         json.dump(rows, f, indent=2)
-    print('\nsaved runs/speed_test.json')
+    print('\nsaved ' + name)
 
 
 if __name__ == '__main__':
