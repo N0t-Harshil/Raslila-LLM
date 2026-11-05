@@ -336,7 +336,9 @@ def cmd_bench(a):
     if a.all:
         import glob
         runs += sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(ROOT, 'runs', '*', 'ckpt.pt'))
-                       if not os.path.basename(os.path.dirname(p)).startswith('smoke'))
+                       if (run_status(os.path.basename(os.path.dirname(p))) or {}).get('data') not in (None, 'synthetic'))
+        if not runs:
+            sys.exit('No trained models (on real data) under runs/ yet.')
     banner('Benchmark: ' + ', '.join(runs))
     rc = 0
     for r in dict.fromkeys(runs):

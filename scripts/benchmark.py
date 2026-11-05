@@ -362,6 +362,16 @@ def task_humaneval(sc, limit):
 
 
 # ---------------------------------------------------------------- main -------
+def is_real_run(run_dir):
+    """A study run trained on real data (not smoke / gpucheck / synthetic)."""
+    import json as _json
+    path = os.path.join(run_dir, 'metrics.json')
+    if not os.path.exists(path):
+        return False
+    with open(path, 'r', encoding='utf-8') as f:
+        return _json.load(f).get('data') != 'synthetic'
+
+
 def load_run(run, device):
     from train_scaling import build_model
     path = os.path.join('runs', run, 'ckpt.pt')
@@ -470,7 +480,7 @@ def main():
     runs = list(args.run or [])
     if args.all:
         runs += sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob('runs/*/ckpt.pt')
-                       if not os.path.basename(os.path.dirname(p)).startswith('smoke'))
+                       if is_real_run(os.path.dirname(p)))
     if not runs:
         sys.exit('Give --run NAME or --all.')
     from tokenizers import Tokenizer

@@ -198,6 +198,13 @@ def main():
 
     raw = model
     if args.compile:
+        if ddp:
+            # DDP's graph splitter ("DDPOptimizer") cannot handle activation
+            # checkpointing (a higher-order op) and crashes. Gradients are
+            # all-reduced once per optimizer step anyway (no_sync during
+            # accumulation), so one bucket for the whole graph costs ~nothing.
+            import torch._dynamo
+            torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     if ddp:
         find_unused = family == 'raslila' and (adaptive or model_depth_sweeps(raw) == 1)
