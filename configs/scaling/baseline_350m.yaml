@@ -11,7 +11,7 @@ train:
   tokens: 7.0e9           # SAME token budget for both families in this tier (~20 tokens/param)
   seq_len: 1024
   batch_tokens: 524288    # 0.5M tokens per optimizer step (GPT-3 recipe)
-  micro_batch: 8      # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  micro_batch: 16      # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
   lr: 3.0e-4
   min_lr_frac: 0.1
   weight_decay: 0.1

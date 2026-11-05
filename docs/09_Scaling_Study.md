@@ -166,6 +166,19 @@ counts is Raslila vs the baseline at the same size, and how the gap moves
 with size. A full benchmark takes minutes for 50m and roughly an hour for 1b
 on one GPU.
 
+## Measured speed (A100-SXM4-80GB, torch 2.5.1, compiled, 2026-11-05)
+
+| tier | baseline tok/s | Raslila 1 cycle | Raslila 2 cycles | Raslila as trained (1-2 mixed) | MFU baseline / Raslila |
+|---|---|---|---|---|---|
+| 125m | 158,392 | 95,157 | 33,694 | ~50,000 (3.2x slower) | 39% / 30% |
+| 1b | 21,582 | 15,472 | 5,120 | ~7,700 (2.8x slower) | 44% / 36% |
+
+- torch.compile gives ~2.5x on both families (uncompiled: 22% / 9% MFU), so it is on by default (`--no-compile` disables it).
+- Raslila without activation checkpointing is 1.28x faster at both sizes and fits, so its configs now have it off.
+- Speed gate: with 1 cycle Raslila runs at 60-70% of the baseline's speed. **Passed.** The rest of its cost is the extra compute of the second cycle, which the report charges against it.
+- Estimated study cost at these efficiencies: ~300 GPU-hours (baseline) + ~900 (Raslila), about **13 days on 4 GPUs or 18 on 3**. The 50m + 125m pairs take about 8 hours on 3 GPUs.
+- The machine is shared. On 2026-11-05 GPU 2 was ~94% busy with another tenant's job. Multi-GPU training runs at the pace of the slowest GPU, so exclude a busy GPU (`CUDA_VISIBLE_DEVICES=0,1,3`). Tokens per step stay identical across families on any GPU count.
+
 ## Decision rules (fixed before seeing the results)
 
 1. **Speed gate (day 1).** `run.py speed`: if Raslila v2 runs at less than

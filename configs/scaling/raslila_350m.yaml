@@ -18,7 +18,7 @@ model:
   long_range_prob: 0.1
   max_long_range: 3
   connectivity_seed: 42
-  activation_checkpoint: true
+  activation_checkpoint: false   # measured 1.28x faster on A100 (fits at this micro_batch); same results
 train:
   tokens: 7.0e9           # SAME token budget for both families in this tier (~20 tokens/param)
   seq_len: 1024

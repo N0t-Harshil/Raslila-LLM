@@ -21,8 +21,7 @@ The prompt should now start with `(raslila-fast)`, not `(base)`.
 python run.py setup                       # packages + GPUs
 python run.py check                       # study configs are fair and build
 python run.py smoke                       # both models train
-python run.py gpucheck                    # multi-GPU training works on all 4 GPUs
-python run.py gpucheck --compile          # ... and with torch.compile
+python run.py gpucheck                    # multi-GPU training works (compiled), 12 steps
 ```
 
 ## 2. Data (once, hours)
@@ -37,19 +36,25 @@ python run.py speed --tier 125m --compile
 python run.py speed --tier 1b --compile
 ```
 Each prints tokens/s for the baseline and Raslila, with activation checkpointing ON and OFF.
-Use whatever is fastest in the study command below (`--compile`, `--no-ckpt`).
+Already done on 2026-11-05; the results are in docs/09_Scaling_Study.md ("Measured speed").
 
 ## 4. Train + benchmark + compare (days)
+The fast settings are now the defaults (torch.compile on; Raslila without activation
+checkpointing; micro-batches set from the A100 speed test). No extra flags are needed.
+
+The machine is shared: if `nvidia-smi` shows a GPU busy with someone else's job (GPU 2 on
+2026-11-05), leave it out, because multi-GPU training runs at the speed of the slowest GPU:
 ```bash
-# first the small sizes (~1 day): the first real Raslila-vs-baseline result
-python run.py study --tiers 50m,125m --compile --no-ckpt
-# then, if Raslila holds up, everything (finished models are skipped)
-python run.py study --compile --no-ckpt
+nvidia-smi                                                        # which GPUs are free?
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 350m     # memory check, bigger sizes
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 1b
+# first the small sizes (~8 hours on 3 GPUs): the first real Raslila-vs-baseline result
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py study --tiers 50m,125m
+# then, if Raslila holds up, everything (finished models are skipped; ~2.5 weeks on 3 GPUs)
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py study
 ```
-Leave out `--compile` / `--no-ckpt` if the speed test or gpucheck says they don't help or don't fit.
-For the big sizes, use `--no-ckpt` only if the **1b** speed test showed `ckpt off` fitting at a micro-batch of at least 2
-(the 1b config's value); otherwise run `python run.py study --compile` for those.
-Add `--run-code` to include HumanEval pass@1 (runs model-written Python).
+Keep the same GPUs for the whole study. If all 4 are free, drop the `CUDA_VISIBLE_DEVICES=...` part.
+Add `--run-code` to include HumanEval pass@1 (runs model-written Python). `--no-compile` turns compile off.
 
 ## 5. Watch it (any time, in another tmux window)
 ```bash
@@ -79,7 +84,7 @@ python run.py scale --tier 125m --family raslila --gpus 4   # one model by hand
 ## If something goes wrong
 | problem | fix |
 |---|---|
-| `CUDA out of memory` | remove `--no-ckpt`, or add `--micro-batch 4` to `scale` |
+| `CUDA out of memory` | halve `micro_batch` in that model's config (configs/scaling/<model>.yaml) and run the same command again; results are unaffected |
 | `torch.compile: FAILED` in make_env | `conda install -y -c conda-forge gxx_linux-64`, then run without `--compile` meanwhile |
 | `unauthenticated requests` warning | `hf auth login` again in this env |
 | a model FAILED in the study | `less runs/<model>/train.log`, paste the end of it |

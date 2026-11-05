@@ -431,13 +431,15 @@ def main():
     p.add_argument('--family', default='both', choices=FAMILIES + ['both'])
     p.add_argument('--gpus', type=int, default=1)
     p.add_argument('--micro-batch', type=int, default=None)
-    p.add_argument('--compile', action='store_true')
+    p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
+                   help='torch.compile (default on: measured 2.5x faster; --no-compile to disable)')
     p.add_argument('--no-ckpt', action='store_true', help='no activation checkpointing (faster if it fits)')
     p = add('study', cmd_study, 'train every model one after another (each on all GPUs), '
                                 'benchmark each, keep the comparison up to date')
     p.add_argument('--gpus', type=int, default=None, help='default: all visible')
     p.add_argument('--tiers', default='50m,125m,350m,1b')
-    p.add_argument('--compile', action='store_true')
+    p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
+                   help='torch.compile (default on: measured 2.5x faster; --no-compile to disable)')
     p.add_argument('--no-ckpt', action='store_true', help='no activation checkpointing (faster if it fits)')
     p.add_argument('--no-bench', action='store_true', help='skip benchmarking after each model')
     p.add_argument('--quick', action='store_true', help='quick benchmarks (300 examples per task)')
@@ -453,7 +455,8 @@ def main():
     p = add('gpucheck', cmd_gpucheck, '2-minute check that multi-GPU (+ compile) training works')
     p.add_argument('--tier', default='125m', choices=TIERS)
     p.add_argument('--gpus', type=int, default=None)
-    p.add_argument('--compile', action='store_true')
+    p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
+                   help='torch.compile (default on: measured 2.5x faster; --no-compile to disable)')
     p.add_argument('--no-ckpt', action='store_true')
     add('status', cmd_status, 'one line per model: progress, val loss, ETA')
     add('report', cmd_report, 'compare every model: training, benchmarks, loops, scaling fit')
