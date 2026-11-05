@@ -31,6 +31,7 @@ os.chdir(_ROOT)
 
 import numpy as np
 import torch
+import torch._dynamo
 import torch.nn.functional as F
 import yaml
 
@@ -203,7 +204,6 @@ def main():
             # checkpointing (a higher-order op) and crashes. Gradients are
             # all-reduced once per optimizer step anyway (no_sync during
             # accumulation), so one bucket for the whole graph costs ~nothing.
-            import torch._dynamo
             torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     if ddp:
