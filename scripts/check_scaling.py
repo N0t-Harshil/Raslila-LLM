@@ -57,7 +57,8 @@ def main():
             if fam == 'raslila' and m.config.max_think_cycles > 0:
                 # training samples 1..max cycles uniformly: average sweeps and exits
                 k = m.config.max_think_cycles
-                fpt = sum(m.flops_per_token(seq, sweeps=2 * c - 1, exits=c) for c in range(1, k + 1)) / k
+                fpt = sum(m.flops_per_token(seq, sweeps=m.sweeps_for_cycles(c), exits=c)
+                          for c in range(1, k + 1)) / k
             else:
                 fpt = m.flops_per_token(seq)
             tok = float(cfg['train']['tokens'])

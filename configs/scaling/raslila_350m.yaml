@@ -12,6 +12,8 @@ model:
   node_depth: 2
   d_embed: 1024
   max_think_cycles: 2
+  routing: true          # v3: per token, each block picks which neighbours to listen to
+  msg_rank: 0            # routed channel width; 0 = d_node/4 (cheap connections)
   depth_sweeps: 2
   lateral: true
   feedback: true

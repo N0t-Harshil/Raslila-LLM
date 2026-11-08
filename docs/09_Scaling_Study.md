@@ -179,6 +179,36 @@ on one GPU.
 - Estimated study cost at these efficiencies: ~300 GPU-hours (baseline) + ~900 (Raslila), about **13 days on 4 GPUs or 18 on 3**. The 50m + 125m pairs take about 8 hours on 3 GPUs.
 - The machine is shared. On 2026-11-05 GPU 2 was ~94% busy with another tenant's job. Multi-GPU training runs at the pace of the slowest GPU, so exclude a busy GPU (`CUDA_VISIBLE_DEVICES=0,1,3`). Tokens per step stay identical across families on any GPU count.
 
+## Result 1: v2 at 50m / 125m (2026-11-05) and the v3 change
+
+| tier | baseline val loss | Raslila v2 val loss | gap | compute multiplier |
+|---|---|---|---|---|
+| 50m | 3.1395 | 3.3313 | +0.19 | |
+| 125m | 2.6793 | 2.8017 | +0.12 | 0.24x (Raslila matches a baseline using 1/4 of its compute) |
+
+The baseline was also better on every bits-per-byte benchmark (wikitext, gsm8k,
+humaneval: 5-9%), and the 2nd thinking cycle was slightly *worse* than the 1st
+(+0.011 / +0.005). By rules 2 and 4 below, 350m/1b were not run with v2.
+The v2 runs are kept in `runs/v2/`.
+
+Diagnosis: in v2 every block received the same fixed average of its
+neighbours through one linear map, upward only on the way up and downward
+only on the way down. No block could choose what to listen to, so the cube
+behaved like loosely coupled narrow towers.
+
+**v3 (`routing: true`, now in every raslila config).** For every token, every
+block chooses whom to listen to: each sideways neighbour and long-range link,
+the block below (fresh), the block above (feedback from its previous state), or
+nobody. The choice is a softmax over those sources, scored by content and by a
+learned key per *direction*, through a narrow `msg_rank` channel (d_node/4).
+Connections stay cheap, and a block can switch them off. Feedback now arrives
+inside each upward sweep, so a thinking cycle is one sweep instead of two
+(compute 2.4x -> 1.9x the baseline's per token at 50m). On a toy task where
+each token must fetch from "below" or "above" depending on its own state, the
+learned router reaches loss 0.04 versus 0.54 for v2-style fixed averaging.
+Whether this closes the gap on language is what the 50m/125m rerun measures;
+the decision rules below are unchanged.
+
 ## Decision rules (fixed before seeing the results)
 
 1. **Speed gate (day 1).** `run.py speed`: if Raslila v2 runs at less than

@@ -56,6 +56,16 @@ CUDA_VISIBLE_DEVICES=0,1,3 python run.py study
 Keep the same GPUs for the whole study. If all 4 are free, drop the `CUDA_VISIBLE_DEVICES=...` part.
 Add `--run-code` to include HumanEval pass@1 (runs model-written Python). `--no-compile` turns compile off.
 
+### 4b. Raslila v3 (learned routing, 2026-11-08): rerun the small sizes
+v2 lost at 50m/125m (see docs/09). Keep its runs aside and train v3; the finished
+baselines are reused (skipped), so this trains only the two Raslila models:
+```bash
+git pull
+mkdir -p runs/v2 && mv runs/raslila_* runs/v2/
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 125m    # v3 + compile on 3 GPUs, minutes
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py study --tiers 50m,125m
+```
+
 ## 5. Watch it (any time, in another tmux window)
 ```bash
 source ~/raslila-fast/bin/activate

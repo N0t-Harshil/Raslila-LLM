@@ -32,6 +32,20 @@ WHY v2 (measured on the A100, 2026-11)
       embedding width instead of averaging it down to one block's width.
 
     Grids are uniform here (every sheet rows x cols); v1 keeps per-layer shapes.
+
+v3 ROUTING (`routing: true`, 2026-11-08)
+    The 50m/125m study showed v2 losing to the baseline (+0.19 / +0.12 val loss
+    at equal size) and its 2nd thinking cycle not helping. In v2 every block
+    received the same fixed AVERAGE of its neighbours through one linear map,
+    upward only on the way up and downward only on the way down; nothing could
+    choose. With routing, for every token every block decides whom to listen
+    to: each sideways neighbour (and its long-range links), the block below
+    (fresh this sweep), the block above (its previous state = feedback), or
+    nobody. The choice is a small attention over those sources through a
+    narrow channel of `msg_rank` dims (default d_node/4), so connections stay
+    cheap and a block that does better alone can switch them off.
+    Because feedback from above arrives inside every upward sweep, a thinking
+    cycle is ONE upward sweep instead of down + up (cheaper loops).
 """
 import random
 from dataclasses import dataclass, asdict, field
@@ -63,6 +77,8 @@ class GridConfig:
     max_long_range: int = 3
     feedback: bool = True
     connectivity_seed: int = 42
+    routing: bool = False      # v3: per-token learned choice of direction (see top)
+    msg_rank: int = 0          # width of the routed message channel; 0 = d_node // 4
     rope_theta: float = 10000.0
     activation_checkpoint: bool = True
 
@@ -136,6 +152,91 @@ class GroupedBlock(nn.Module):
         return flat.view(N, B, T, D)
 
 
+class Router(nn.Module):
+    """Per token, every block of a sheet chooses which neighbours to listen to.
+
+    Sources of block i: the blocks of its own sheet it is wired to (grid
+    neighbours + long-range links; snapshot of this sheet), block i of the sheet
+    below (fresh this sweep), block i of the sheet above (previous state:
+    feedback), and a "nobody" slot. Scores are q_i . k_source in a `rank`-dim
+    channel plus a learned per-(block, source) bias; a softmax over the allowed
+    sources picks the mix. Everything is per token and position-wise, so it is
+    causal. The output projection starts at zero: training starts from
+    independent towers and learns how much to listen.
+    """
+
+    def __init__(self, n, d, rank, adjacency, has_below, has_above, lateral):
+        super().__init__()
+        self.n, self.d, self.r = n, d, rank
+        self.has_below, self.has_above = has_below, has_above
+        self.q_norm = nn.Parameter(torch.ones(n, 1, d))
+        self.q = nn.Parameter(torch.randn(n, d, rank) / d ** 0.5)
+        self.lat_norm = nn.Parameter(torch.ones(n, 1, d))
+        self.kv_lat = nn.Parameter(torch.randn(n, d, 2 * rank) / d ** 0.5)
+        if has_below:
+            self.below_norm = nn.Parameter(torch.ones(n, 1, d))
+            self.kv_below = nn.Parameter(torch.randn(n, d, 2 * rank) / d ** 0.5)
+        if has_above:
+            self.above_norm = nn.Parameter(torch.ones(n, 1, d))
+            self.kv_above = nn.Parameter(torch.randn(n, d, 2 * rank) / d ** 0.5)
+        self.o = nn.Parameter(torch.zeros(n, rank, d))
+        # allowed sources per block: [n sideways | below | above | nobody]
+        allow = torch.zeros(n, n + 3, dtype=torch.bool)
+        if lateral:
+            allow[:, :n] = adjacency > 0
+        allow[:, n] = has_below
+        allow[:, n + 1] = has_above
+        allow[:, n + 2] = True
+        self.register_buffer('allow', allow, persistent=False)
+        self.route_bias = nn.Parameter(torch.zeros(n, n + 3))
+        # One learned key per DIRECTION (source slot): lets a block choose
+        # "look up" / "look left" / "listen to nobody" from its own state,
+        # independently of what the neighbour currently holds.
+        self.dir_key = nn.Parameter(torch.randn(n, n + 3, rank) * 0.02)
+
+    def _kv(self, src, norm, w):
+        N, B, T, D = src.shape
+        return torch.bmm(rms_norm_nd(src.reshape(N, B * T, D), norm), w).chunk(2, dim=-1)
+
+    def forward(self, x, below, above):
+        N, B, T, D = x.shape
+        flat = x.reshape(N, B * T, D)
+        q = torch.bmm(rms_norm_nd(flat, self.q_norm), self.q)                   # [N, BT, r]
+        k, v = self._kv(x, self.lat_norm, self.kv_lat)
+        s_lat = torch.bmm(q.transpose(0, 1), k.permute(1, 2, 0))                # [BT, N, N]
+        zero = s_lat.new_zeros(B * T, N, 1)
+        allow = self.allow
+        use_b = self.has_below and below is not None
+        use_a = self.has_above and above is not None
+        s_b = s_a = zero
+        if use_b:
+            kb, vb = self._kv(below, self.below_norm, self.kv_below)
+            s_b = (q * kb).sum(-1).transpose(0, 1).unsqueeze(-1)
+        if use_a:
+            ka, va = self._kv(above, self.above_norm, self.kv_above)
+            s_a = (q * ka).sum(-1).transpose(0, 1).unsqueeze(-1)
+        if (self.has_below and not use_b) or (self.has_above and not use_a):
+            allow = allow.clone()
+            allow[:, N] = use_b
+            allow[:, N + 1] = use_a
+        s_dir = torch.bmm(q, self.dir_key.transpose(1, 2).to(q.dtype)).transpose(0, 1)  # [BT, N, N+3]
+        scores = (torch.cat([s_lat, s_b, s_a, zero], dim=-1) + s_dir).float() * self.r ** -0.5
+        scores = (scores + self.route_bias.float()).masked_fill(~allow, float('-inf'))
+        w = torch.softmax(scores, dim=-1).to(v.dtype)                            # [BT, N, N+3]
+        m = torch.bmm(w[..., :N], v.transpose(0, 1))                             # [BT, N, r]
+        if use_b:
+            m = m + w[..., N:N + 1] * vb.transpose(0, 1)
+        if use_a:
+            m = m + w[..., N + 1:N + 2] * va.transpose(0, 1)
+        out = torch.bmm(m.transpose(0, 1), self.o)                               # [N, BT, D]
+        return out.view(N, B, T, D)
+
+    def flops_per_token(self):
+        """Forward FLOPs per token per block (q, 3x k/v, out, scores, mix)."""
+        n, r, d = self.n, self.r, self.d
+        return 2 * d * r + 3 * (4 * d * r) + 2 * r * d + 4 * n * r + 2 * (n + 3) * r + 8 * r
+
+
 class Sheet(nn.Module):
     """One layer of the grid: lateral + vertical messages, then the blocks."""
 
@@ -145,6 +246,17 @@ class Sheet(nn.Module):
         n = cfg.grid_shape[1] * cfg.grid_shape[2]
         d = cfg.d_node
         self.register_buffer('adj', adjacency, persistent=False)
+        self.router = None
+        if cfg.routing:
+            rank = int(cfg.msg_rank) or max(8, d // 4)
+            self.router = Router(n, d, rank, adjacency, has_below=layer > 0,
+                                 has_above=bool(cfg.feedback) and layer < L - 1,
+                                 lateral=bool(cfg.lateral) and n > 1)
+            self.lateral = False
+            self.up = self.down = None
+            self.blocks = nn.ModuleList([GroupedBlock(n, d, cfg.n_heads, out_scale)
+                                         for _ in range(cfg.node_depth)])
+            return
         self.lateral = bool(cfg.lateral) and n > 1
         if self.lateral:
             self.lat_norm = RMSNorm(d)
@@ -163,9 +275,15 @@ class Sheet(nn.Module):
         self.blocks = nn.ModuleList([GroupedBlock(n, d, cfg.n_heads, out_scale)
                                      for _ in range(cfg.node_depth)])
 
-    def forward(self, h, src, ascending, cos, sin):
+    def forward(self, h, below, above, ascending, cos, sin):
         N = h.shape[0]
         x = h
+        if self.router is not None:
+            x = x + self.router(h, below, above).to(h.dtype)
+            for blk in self.blocks:
+                x = blk(x, cos, sin)
+            return x
+        src = below if ascending else above
         if self.lateral:
             nb = (self.adj.to(h.dtype) @ h.reshape(N, -1)).view_as(h)
             x = x + self.lat_proj(self.lat_norm(nb)).to(h.dtype)
@@ -198,7 +316,10 @@ class RaslilaGrid(nn.Module):
         # cycle is down + up = 2; fixed depth is depth_sweeps). Scaling the
         # output projections by 1/sqrt(2 * branches) keeps the stream's variance
         # independent of how deep the loop runs (GPT-2 / LLaMA init rule).
-        sweeps_per_path = 2 if cfg.max_think_cycles > 0 else max(1, cfg.depth_sweeps)
+        if cfg.max_think_cycles > 0:
+            sweeps_per_path = 1 if cfg.routing else 2
+        else:
+            sweeps_per_path = max(1, cfg.depth_sweeps)
         out_scale = 1.0 / (2 * L * cfg.node_depth * sweeps_per_path) ** 0.5
         self.sheets = nn.ModuleList([
             Sheet(cfg, l, sheet_adjacency(R, C, cfg.diagonal, cfg.long_range_prob,
@@ -210,10 +331,14 @@ class RaslilaGrid(nn.Module):
         self.norm = RMSNorm(e)
 
     # ---- pieces ---------------------------------------------------------
-    def _sheet(self, l, h, src, ascending, cos, sin):
+    def _sheet(self, l, h, below, above, ascending, cos, sin):
         if self.config.activation_checkpoint and self.training and torch.is_grad_enabled():
-            return checkpoint(self.sheets[l], h, src, ascending, cos, sin, use_reentrant=False)
-        return self.sheets[l](h, src, ascending, cos, sin)
+            return checkpoint(self.sheets[l], h, below, above, ascending, cos, sin, use_reentrant=False)
+        return self.sheets[l](h, below, above, ascending, cos, sin)
+
+    def sweeps_for_cycles(self, cycles):
+        """Sweeps run by `cycles` thinking cycles (v3: one each; v2: up, then down + up)."""
+        return cycles if self.config.routing else 2 * cycles - 1
 
     def _readout(self, top):
         N, B, T, D = top.shape
@@ -247,18 +372,18 @@ class RaslilaGrid(nn.Module):
             nonlocal sweeps
             order = range(self.L) if ascending else reversed(range(self.L))
             for l in order:
-                if ascending:
-                    src = S[l - 1] if l > 0 else None
-                else:
-                    src = S[l + 1] if l < self.L - 1 else None
-                S[l] = self._sheet(l, S[l], src, ascending, cos, sin)
+                below = S[l - 1] if l > 0 else None
+                above = S[l + 1] if l < self.L - 1 else None
+                S[l] = self._sheet(l, S[l], below, above, ascending, cos, sin)
             sweeps += 1
 
         cycles = cfg.max_think_cycles if think_cycles is None else int(think_cycles)
         if cycles <= 0:
             n = max(1, cfg.depth_sweeps)
             for i in range(n):
-                sweep((i % 2) == ((n - 1) % 2))                     # last sweep ends at the top
+                # v3: every sweep goes up (feedback arrives through the router);
+                # v2: alternate, the last sweep ends at the top
+                sweep(True if cfg.routing else (i % 2) == ((n - 1) % 2))
             logits = self._readout(S[-1])
             return {'logits': logits, 'exit_logits': [logits], 'sweeps': sweeps, 'cycles_used': None}
 
@@ -274,7 +399,8 @@ class RaslilaGrid(nn.Module):
                     break
             if self.cycle_norm is not None:
                 S = [self.cycle_norm(S[l]).float() + init[l] for l in range(self.L)]
-            sweep(False)
+            if not cfg.routing:
+                sweep(False)
             sweep(True)
             logits = self._readout(S[-1])
             exits.append(logits)
@@ -288,9 +414,13 @@ class RaslilaGrid(nn.Module):
         d, e, n = c.d_node, c.d_embed, self.N
         f = swiglu_hidden(d)
         if sweeps is None:
-            sweeps = max(1, c.depth_sweeps) if c.max_think_cycles <= 0 else 2 * c.max_think_cycles - 1
+            sweeps = max(1, c.depth_sweeps) if c.max_think_cycles <= 0 \
+                else self.sweeps_for_cycles(c.max_think_cycles)
         block = 2 * (4 * d * d + 3 * d * f) + 4 * seq_len * d
-        msgs = 2 * n * d + 2 * 2 * d * d
+        if c.routing:
+            msgs = self.sheets[0].router.flops_per_token()
+        else:
+            msgs = 2 * n * d + 2 * 2 * d * d
         per_sweep = self.L * n * (c.node_depth * block + msgs)
         readout = 2 * n * d * e + 2 * e * c.vocab_size
         return 3 * (2 * e * d + sweeps * per_sweep + exits * readout)
