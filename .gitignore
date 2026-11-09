@@ -62,3 +62,4 @@ Thumbs.db
 # runs/ holds checkpoints and metrics of every training run.
 data/mix/
 runs/
+research/papers/
