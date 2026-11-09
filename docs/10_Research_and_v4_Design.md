@@ -175,12 +175,23 @@ Not now: per-token adaptive depth (loses at our sizes per MoR; revisit at
    - dimensionality hierarchy across the cube (HRM's participation ratio)
    - clustering of the 3D cube's units (Moran's I, TopoLM)
 
-### Experiments at 50m (each ~2–4 h on 3 GPUs), in order
-1. v4-core, same parameters as baseline_50m, mean 6 loops
-2. v4 + 3D spatial loss at a small weight (measure its cost)
-3. learning-rate check for the core (Huginn needed a lower one)
+### Implemented (2026-11-09): tier 150m
+- Model: `src/raslila/cortex.py`.
+- Configs:
+  - `configs/scaling/raslila_150m.yaml`: 162M parameters. d 1024, prelude 2 + core 6 + coda 2, cube 8x8x16, mean 4 loops, backprop through the last 4, headline at 8 loops.
+  - `configs/scaling/baseline_150m.yaml`: 160M parameters, 10 layers x 1024.
+- Same tokens (3.2B), LR (5e-4) and batch for both.
+- v4 spends ~2.2x training compute per token, reported in the head-to-head table.
+- Variant: `configs/scaling/variants/raslila_150m_topo.yaml` (3D brain-region loss on, weight 0.5).
+- Evaluation:
+  - `benchmark.py` scores v4 at 1/2/4/8/16 loops and adds `var_chain` (0–3 hops) and `add2`.
+  - `scaling_report.py` draws `thinking.png`.
+  - `brain_metrics.py` measures the dimensionality hierarchy and 3D clustering.
 
-Decision: if (1) doesn't beat baseline_50m at equal parameters, the literature-backed premise fails at our scale and we stop before 125m.
+Decision: if raslila_150m does not beat baseline_150m at equal parameters (val
+loss and the reasoning tasks), the literature-backed premise fails at our scale
+and we stop before going bigger. Next checks if it is close: core learning rate
+(Huginn needed a lower one), more loops.
 
 ### Honest risks
 - Huginn's training was fragile (2 of 3 runs failed) at 3.5B; small scale was reported as robust.

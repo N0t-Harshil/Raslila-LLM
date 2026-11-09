@@ -49,7 +49,7 @@ os.chdir(_ROOT)
 import torch
 import torch.nn.functional as F
 
-BENCH_VERSION = 1
+BENCH_VERSION = 2
 PAD, EOS = 0, 1
 
 # task -> (primary metric, higher_is_better, chance level)
@@ -65,10 +65,13 @@ TASKS = {
     'gsm8k_bpb':     ('bpb', False, None),
     'humaneval_bpb': ('bpb', False, None),
     'gsm8k':         ('exact_match', True, 0.0),
+    'var_chain':     ('acc', True, 0.10),
+    'add2':          ('acc', True, 0.25),
     'humaneval':     ('pass@1', True, 0.0),
 }
 DEFAULT_TASKS = [t for t in TASKS if t != 'humaneval']
 GROUPS = {'general': ['hellaswag', 'arc_easy', 'arc_challenge', 'sciq', 'openbookqa', 'winogrande', 'lambada'],
+          'reasoning': ['var_chain', 'add2'],
           'math': ['gsm8k_bpb', 'gsm8k'], 'code': ['humaneval_bpb', 'humaneval'], 'lm': ['wikitext_bpb']}
 
 
@@ -121,18 +124,23 @@ def mc_docs(task):
 class Scorer:
     def __init__(self, model, tok, device, think, max_len, batch_tokens):
         self.model, self.tok, self.device = model, tok, device
-        self.adaptive = model.family == 'raslila' and model.config.max_think_cycles > 0
-        self.think = think if self.adaptive else None
+        self.looped = bool(getattr(model, 'looped', False))
+        self.adaptive = model.family == 'raslila' and not self.looped and model.config.max_think_cycles > 0
+        self.think = think if (self.adaptive or self.looped) else None
         self.max_len, self.batch_tokens = max_len, batch_tokens
-        self.n_exits = think if self.adaptive else 1
+        self.n_exits = len(think) if self.looped else (think if self.adaptive else 1)
 
     def enc(self, text):
         return self.tok.encode(text).ids
 
     @torch.no_grad()
-    def forward(self, x):
+    def forward(self, x, gen=False):
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=self.device.type == 'cuda'):
-            if self.adaptive:
+            if self.looped and gen:                  # generation: the model's default thinking time
+                out = self.model(x)
+            elif self.looped:
+                out = self.model(x, exit_at=self.think)
+            elif self.adaptive:
                 out = self.model(x, think_cycles=self.think, halt=False)
             else:
                 out = self.model(x)
@@ -197,7 +205,7 @@ class Scorer:
                 x = torch.zeros(len(rows), L, dtype=torch.long)
                 for k, r in enumerate(rows):
                     x[k, :len(r)] = torch.tensor(r)
-                lg = self.forward(x.to(self.device))[-1]
+                lg = self.forward(x.to(self.device), gen=True)[-1]
                 last = torch.tensor([len(r) - 1 for r in rows], device=self.device)
                 nl = lg[torch.arange(len(rows), device=self.device), last].float()
                 nl[:, PAD] = float('-inf')
@@ -361,6 +369,74 @@ def task_humaneval(sc, limit):
     return [{'pass@1': passed / len(rows)}], len(rows), gens[:2]
 
 
+# ------------------------------------------------- synthetic reasoning --------
+# Small models score ~chance on arc/gsm8k, which hides reasoning differences.
+# These procedurally generated, 5-shot tasks need multi-step use of the
+# context (not memorised facts) and are where looped models were shown to
+# beat even deeper standard models (Saunshi et al. 2025, "reasoning
+# primitives"). Fixed seed: identical questions for every model.
+def _var_chain_doc(rng, depth):
+    import string
+    names = rng.sample(string.ascii_lowercase, 6 + depth)
+    vals = {}
+    lines = []
+    for n in names[:6]:
+        vals[n] = rng.randrange(10)
+        lines.append('{}={}'.format(n, vals[n]))
+    prev = rng.choice(names[:6])
+    for n in names[6:6 + depth]:
+        lines.append('{}={}'.format(n, prev))
+        vals[n] = vals[prev]
+        prev = n
+    rng.shuffle(lines)
+    q = prev
+    return ', '.join(lines) + ', {}=?'.format(q), vals[q]
+
+
+def task_var_chain(sc, limit):
+    import random as _r
+    rng = _r.Random(20261109)
+    shots = []
+    for d in (0, 1, 2, 1, 2):
+        text, ans = _var_chain_doc(rng, d)
+        shots.append('{} {}'.format(text, ans))
+    prefix = '\n'.join(shots) + '\n'
+    n = limit or 600
+    by_depth = {d: [] for d in range(4)}            # 0..3 hops of indirection
+    for i in range(n):
+        d = i % 4
+        text, ans = _var_chain_doc(rng, d)
+        by_depth[d].append((prefix + text, [' {}'.format(v) for v in range(10)], ans))
+    parts = {d: run_mc(sc, docs, 'var_chain d{}'.format(d)) for d, docs in by_depth.items() if docs}
+    per = []
+    for e in range(sc.n_exits):
+        row = {'acc_hops{}'.format(d): parts[d][e]['acc'] for d in parts}
+        row['acc'] = sum(parts[d][e]['acc'] * len(by_depth[d]) for d in parts) / n
+        row['acc_norm'] = row['acc']
+        per.append(row)
+    return per, n
+
+
+def task_add2(sc, limit):
+    import random as _r
+    rng = _r.Random(20261110)
+
+    def q():
+        a, b = rng.randrange(10, 100), rng.randrange(10, 100)
+        return a, b, a + b
+    prefix = ''.join('{}+{}={}\n'.format(*q()) for _ in range(5))
+    n = limit or 600
+    docs = []
+    for _ in range(n):
+        a, b, s = q()
+        wrong = list({s + 1, s - 1, s + 10, s - 10, s + 11} - {s})
+        rng.shuffle(wrong)
+        opts = [s] + wrong[:3]
+        rng.shuffle(opts)
+        docs.append((prefix + '{}+{}='.format(a, b), [str(o) for o in opts], opts.index(s)))
+    return run_mc(sc, docs, 'add2'), n
+
+
 # ---------------------------------------------------------------- main -------
 def is_real_run(run_dir):
     """A study run trained on real data (not smoke / gpucheck / synthetic)."""
@@ -385,8 +461,12 @@ def load_run(run, device):
 def bench_run(run, args, device, tok):
     out_path = os.path.join('runs', run, 'benchmark.json')
     model, ck = load_run(run, device)
-    adaptive = model.family == 'raslila' and model.config.max_think_cycles > 0
+    looped = bool(getattr(model, 'looped', False))
+    adaptive = model.family == 'raslila' and not looped and model.config.max_think_cycles > 0
     think = (args.think or model.config.max_think_cycles) if adaptive else None
+    if looped:   # loop counts to read out; the headline value is at test_loops
+        think = sorted(set([int(v) for v in args.loops.split(',')] if args.loops else model.config.eval_loops)
+                       | {model.config.test_loops})
     tasks = [t for t in (args.tasks.split(',') if args.tasks else DEFAULT_TASKS)]
     if args.run_code and 'humaneval' not in tasks:
         tasks.append('humaneval')
@@ -407,7 +487,8 @@ def bench_run(run, args, device, tok):
     print('=' * 78)
     print('BENCHMARK {} | {} | step {} | {:.2f}B tokens{}'.format(
         run, model.family, ck['step'], ck['tokens_seen'] / 1e9,
-        ' | thinking cycles 1..{} scored separately'.format(think) if adaptive else ''))
+        ' | thinking cycles 1..{} scored separately'.format(think) if adaptive else
+        (' | read out after {} loops (headline: {})'.format(think, model.config.test_loops) if looped else '')))
     if not todo:
         print('  all requested tasks already scored for this checkpoint (use --force to redo)')
     sc = Scorer(model, tok, device, think, args.max_len, args.batch_tokens)
@@ -428,6 +509,10 @@ def bench_run(run, args, device, tok):
                 per, n = task_gsm8k_bpb(sc, limit)
             elif t == 'humaneval_bpb':
                 per, n = task_humaneval_bpb(sc, limit)
+            elif t == 'var_chain':
+                per, n = task_var_chain(sc, limit)
+            elif t == 'add2':
+                per, n = task_add2(sc, limit)
             elif t == 'gsm8k':
                 per, n, samples = task_gsm8k(sc, args.gen_limit)
             elif t == 'humaneval':
@@ -439,13 +524,17 @@ def bench_run(run, args, device, tok):
             print('  {} FAILED: {}: {}'.format(t, type(e).__name__, str(e)[:300]))
             continue
         metric = TASKS[t][0]
-        results[t] = {'metric': metric, 'value': per[-1][metric], 'n': n, 'all': per[-1],
+        head = think.index(model.config.test_loops) if (looped and len(per) > 1) else -1
+        results[t] = {'metric': metric, 'value': per[head][metric], 'n': n, 'all': per[head],
                       'per_cycle': [p[metric] for p in per] if len(per) > 1 else None,
+                      'exit_loops': think if (looped and len(per) > 1) else None,
                       'seconds': time.time() - t0, 'samples': samples}
         cyc = ''
         if len(per) > 1:
             cyc = '   per cycle: ' + ' -> '.join('{:.4f}'.format(p[metric]) for p in per)
-        print('  {:<14} {:<11} {:.4f}  (n={}, {:.0f}s){}'.format(t, metric, per[-1][metric], n,
+            if looped:
+                cyc = '   by loops: ' + '  '.join('{}:{:.4f}'.format(r, p[metric]) for r, p in zip(think, per))
+        print('  {:<14} {:<11} {:.4f}  (n={}, {:.0f}s){}'.format(t, metric, per[head][metric], n,
                                                               time.time() - t0, cyc), flush=True)
         with open(out_path, 'w', encoding='utf-8') as f:     # save after every task
             json.dump({'run': run, 'family': model.family, 'key': key, 'step': ck['step'],
@@ -466,7 +555,8 @@ def main():
     ap.add_argument('--limit', type=int, default=None, help='max examples per scoring task')
     ap.add_argument('--gen-limit', type=int, default=250, help='examples for gsm8k / humaneval generation')
     ap.add_argument('--quick', action='store_true', help='300 examples per task')
-    ap.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila (default: trained max)')
+    ap.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila v2/v3 (default: trained max)')
+    ap.add_argument('--loops', default=None, help='Raslila v4: loop counts to score, e.g. 1,2,4,8,16,32')
     ap.add_argument('--run-code', action='store_true', help='execute HumanEval completions (pass@1)')
     ap.add_argument('--max-len', type=int, default=1024)
     ap.add_argument('--batch-tokens', type=int, default=16384)

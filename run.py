@@ -43,7 +43,7 @@ import time
 ROOT = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.join(ROOT, 'src'))
 PY = sys.executable
-TIERS = ['50m', '125m', '350m', '1b']
+TIERS = ['50m', '125m', '150m', '350m', '1b']   # 150m: Raslila v4 (cortex); the others: grid v3
 FAMILIES = ['raslila', 'baseline']
 
 
@@ -172,7 +172,7 @@ def cmd_check(a):
 
 def cmd_smoke(a):
     banner('Smoke test: both model families, random tokens, a few seconds each')
-    for fam in FAMILIES:
+    for fam in FAMILIES + ['cortex']:
         rc = run([PY, 'scripts/train_scaling.py', '--config', 'configs/scaling/smoke_{}.yaml'.format(fam),
                   '--synthetic', '--fresh'], 'smoke_' + fam)
         if rc:
@@ -268,6 +268,8 @@ def bench_cmd(runs, a):
         cmd.append('--run-code')
     if getattr(a, 'think', None):
         cmd += ['--think', str(a.think)]
+    if getattr(a, 'loops', None):
+        cmd += ['--loops', a.loops]
     if getattr(a, 'tasks', None):
         cmd += ['--tasks', a.tasks]
     if getattr(a, 'force', False):
@@ -284,21 +286,25 @@ def cmd_study(a):
     if gpus < 1:
         sys.exit('No GPUs visible.')
     tiers = [t for t in TIERS if t in a.tiers.split(',')]
-    order = [(f, t) for t in tiers for f in ('baseline', 'raslila')]
-    names = ['{}_{}'.format(f, t) for f, t in order]
+    order = [('{}_{}'.format(f, t), 'configs/scaling/{}_{}.yaml'.format(f, t))
+             for t in tiers for f in ('baseline', 'raslila')]
+    for v in (a.variant or []):            # e.g. raslila_150m_topo -> configs/scaling/variants/
+        path = v if v.endswith('.yaml') else 'configs/scaling/variants/{}.yaml'.format(v)
+        if not os.path.exists(os.path.join(ROOT, path)):
+            sys.exit('no such variant config: ' + path)
+        order.append((os.path.splitext(os.path.basename(path))[0], path))
+    names = [n for n, _ in order]
     banner('Study: {} models, one after another, each on {} GPU(s)\n  {}'.format(
         len(order), gpus, ' -> '.join(names)))
     extra = (['--compile'] if a.compile else []) + (['--no-ckpt'] if a.no_ckpt else [])
     study_log('STUDY START on {} GPU(s){}: {}'.format(gpus, ' ' + ' '.join(extra) if extra else '',
                                                      ' -> '.join(names)))
     failed = []
-    for n, (fam, tier) in enumerate(order, 1):
-        name = '{}_{}'.format(fam, tier)
+    for n, (name, cfg) in enumerate(order, 1):
         st = run_status(name)
         if st and st.get('finished'):
             print('[{}/{}] {} already trained (val loss {:.4f})'.format(n, len(order), name, st['val_loss']))
         else:
-            cfg = 'configs/scaling/{}.yaml'.format(name)
             banner('[{}/{}] TRAINING {} on {} GPU(s)'.format(n, len(order), name, gpus))
             study_log('START {} ({}/{})'.format(name, n, len(order)))
             t0 = time.time()
@@ -350,26 +356,36 @@ def cmd_bench(a):
     return rc
 
 
+def cmd_brain(a):
+    cmd = [PY, 'scripts/brain_metrics.py']
+    for r in a.run:
+        cmd += ['--run', r]
+    return run(cmd, 'brain')
+
+
 def cmd_status(a):
     banner('Status of every model (runs/)')
     print('{:<16} {:>9} {:>13} {:>9} {:>11} {:>8}  {}'.format(
         'model', 'params', 'progress', 'val loss', 'tok/s', 'ETA', 'benchmarks'))
-    for t in TIERS:
-        for f in ('baseline', 'raslila'):
-            name = '{}_{}'.format(f, t)
-            st = run_status(name)
-            if not st:
-                print('{:<16} {:>9}'.format(name, 'not started'))
-                continue
-            done, total = st.get('steps_done', 0), max(1, st.get('steps_total', 1))
-            eta = '' if st.get('finished') else '{:.1f}h'.format(
-                (total - done) * st['train_seconds'] / max(1, done) / 3600)
-            val = st.get('val_loss')
-            print('{:<16} {:>8.0f}M {:>12} {:>9} {:>11,.0f} {:>8}  {}'.format(
-                name, st['params_total'] / 1e6,
-                'finished' if st.get('finished') else '{:.0%} ({}/{})'.format(done / total, done, total),
-                '{:.4f}'.format(val) if val else '-', st['tokens_per_second'], eta,
-                'yes' if os.path.exists(os.path.join(ROOT, 'runs', name, 'benchmark.json')) else '-'))
+    import glob
+    names = ['{}_{}'.format(f, t) for t in TIERS for f in ('baseline', 'raslila')]
+    names += sorted(os.path.basename(os.path.dirname(p)) for p in glob.glob(os.path.join(ROOT, 'runs', '*', 'metrics.json'))
+                    if os.path.basename(os.path.dirname(p)).count('_') >= 2
+                    and not os.path.basename(os.path.dirname(p)).startswith(('gpucheck', 'smoke', 'zz')))
+    for name in names:
+        st = run_status(name)
+        if not st:
+            print('{:<16} {:>9}'.format(name, 'not started'))
+            continue
+        done, total = st.get('steps_done', 0), max(1, st.get('steps_total', 1))
+        eta = '' if st.get('finished') else '{:.1f}h'.format(
+            (total - done) * st['train_seconds'] / max(1, done) / 3600)
+        val = st.get('val_loss')
+        print('{:<16} {:>8.0f}M {:>12} {:>9} {:>11,.0f} {:>8}  {}'.format(
+            name, st['params_total'] / 1e6,
+            'finished' if st.get('finished') else '{:.0%} ({}/{})'.format(done / total, done, total),
+            '{:.4f}'.format(val) if val else '-', st['tokens_per_second'], eta,
+            'yes' if os.path.exists(os.path.join(ROOT, 'runs', name, 'benchmark.json')) else '-'))
     if os.path.exists(STUDY_LOG):
         with open(STUDY_LOG, 'r', encoding='utf-8') as f:
             tail = f.readlines()[-8:]
@@ -437,7 +453,10 @@ def main():
     p = add('study', cmd_study, 'train every model one after another (each on all GPUs), '
                                 'benchmark each, keep the comparison up to date')
     p.add_argument('--gpus', type=int, default=None, help='default: all visible')
-    p.add_argument('--tiers', default='50m,125m,350m,1b')
+    p.add_argument('--tiers', default='150m',
+                   help='comma list of sizes; 150m = Raslila v4 (default), 50m/125m/350m/1b = old grid v3')
+    p.add_argument('--variant', action='append', default=[],
+                   help='also train a variant after the pairs, e.g. raslila_150m_topo (configs/scaling/variants/)')
     p.add_argument('--compile', action=argparse.BooleanOptionalAction, default=True,
                    help='torch.compile (default on: measured 2.5x faster; --no-compile to disable)')
     p.add_argument('--no-ckpt', action='store_true', help='no activation checkpointing (faster if it fits)')
@@ -449,9 +468,12 @@ def main():
     p.add_argument('--all', action='store_true', help='every model with a checkpoint')
     p.add_argument('--quick', action='store_true', help='300 examples per task')
     p.add_argument('--tasks', default=None, help='comma list, e.g. hellaswag,gsm8k')
-    p.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila')
+    p.add_argument('--think', type=int, default=None, help='thinking cycles for Raslila v2/v3')
+    p.add_argument('--loops', default=None, help='Raslila v4: loop counts to score, e.g. 1,2,4,8,16,32')
     p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
     p.add_argument('--force', action='store_true', help='re-score even if cached')
+    p = add('brain', cmd_brain, 'brain-likeness of a trained model: dimensionality hierarchy + 3D clustering')
+    p.add_argument('--run', action='append', required=True, help='e.g. raslila_150m (repeatable)')
     p = add('gpucheck', cmd_gpucheck, '2-minute check that multi-GPU (+ compile) training works')
     p.add_argument('--tier', default='125m', choices=TIERS)
     p.add_argument('--gpus', type=int, default=None)

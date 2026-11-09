@@ -61,7 +61,11 @@ def load_model(args):
         model = build_model(ckpt['model_config'])
         model.load_state_dict(ckpt['model'])
         model.eval()
-        if not hasattr(model.config, 'max_think_cycles'):
+        if getattr(model, 'looped', False):
+            # v4 cortex: adaptive thinking up to the largest evaluated loop count
+            model.config.max_think_cycles = max(model.config.eval_loops)
+            model.config.depth_sweeps = 1
+        elif not hasattr(model.config, 'max_think_cycles'):
             model.config.max_think_cycles = 0      # baseline: fixed depth
             model.config.depth_sweeps = 1
         window = int(args.window or ckpt.get('train_config', {}).get('seq_len', 1024))
@@ -217,7 +221,10 @@ class Live:
         ids = torch.tensor([self.context[-self.window:]], dtype=torch.long, device=self.device)
         use_bf16 = self.device.type == 'cuda'
         with torch.no_grad(), torch.amp.autocast('cuda', dtype=torch.bfloat16, enabled=use_bf16):
-            out = self.model(ids, think_cycles=self.think)
+            if getattr(self.model, 'looped', False):
+                out = self.model(ids, loops=self.think or self.model.config.max_think_cycles, halt=True)
+            else:
+                out = self.model(ids, think_cycles=self.think)
         last = out['logits'][0, -1].float()
         last[0] = float('-inf')                       # never sample <|pad|>
         if self.args.top_k > 0:

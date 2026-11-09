@@ -56,6 +56,22 @@ CUDA_VISIBLE_DEVICES=0,1,3 python run.py study
 Keep the same GPUs for the whole study. If all 4 are free, drop the `CUDA_VISIBLE_DEVICES=...` part.
 Add `--run-code` to include HumanEval pass@1 (runs model-written Python). `--no-compile` turns compile off.
 
+### 4a. Raslila v4 at 150m (current, 2026-11-09): the 3D cortex that thinks in loops
+Design and the papers behind it: docs/10_Research_and_v4_Design.md. Model: src/raslila/cortex.py.
+160M baseline vs 162M Raslila v4 (same parameters; v4 spends ~2.2x compute per token by looping).
+```bash
+git pull
+mkdir -p runs/v3 && mv runs/raslila_50m runs/raslila_125m runs/v3/ 2>/dev/null   # keep old grid runs out of the fit
+python run.py smoke                                                # now also tests v4
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 150m      # memory check (minutes)
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py study                     # default tier: 150m (~3 h + ~6 h)
+python run.py brain --run raslila_150m --run baseline_150m         # brain-likeness, measured
+```
+Optional, after that: the 3D brain-region loss as its own experiment (costs val loss in TopoLM):
+`CUDA_VISIBLE_DEVICES=0,1,3 python run.py study --variant raslila_150m_topo`
+Results: `runs/scaling_report.md` and `runs/thinking.png` (accuracy vs thinking loops; the baseline is the flat line).
+More loops at test time: `python run.py bench --run raslila_150m --loops 1,2,4,8,16,32 --force`
+
 ### 4b. Raslila v3 (learned routing, 2026-11-08): rerun the small sizes
 v2 lost at 50m/125m (see docs/09). Keep its runs aside and train v3; the finished
 baselines are reused (skipped), so this trains only the two Raslila models:

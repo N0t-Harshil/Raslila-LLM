@@ -50,6 +50,8 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     model, ck = load_run(args.run, device)
     adaptive = getattr(model.config, 'max_think_cycles', 0) > 0
+    looped = bool(getattr(model, 'looped', False))     # v4: thinks until its answer settles
+    cap = (args.think or max(model.config.eval_loops)) if looped else None
     print('[{} | step {} | {:.2f}B tokens trained]'.format(args.run, ck['step'], ck['tokens_seen'] / 1e9))
     ids = tok.encode(args.prompt).ids
     sys.stdout.write(args.prompt)
@@ -57,7 +59,10 @@ def main():
     for _ in range(args.tokens):
         x = torch.tensor([ids[-args.window:]], device=device)
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=device.type == 'cuda'):
-            out = model(x, think_cycles=args.think) if adaptive else model(x)
+            if looped:
+                out = model(x, loops=cap, halt=True)
+            else:
+                out = model(x, think_cycles=args.think) if adaptive else model(x)
         logits = out['logits'][0, -1].float()
         logits[0] = float('-inf')
         if args.top_k:

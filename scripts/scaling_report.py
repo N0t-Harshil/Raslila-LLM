@@ -1,4 +1,9 @@
-"""Scaling report: Raslila v2 vs the baseline, from every finished run.
+"""Scaling report: Raslila vs the baseline, from every finished run.
+
+Raslila v4 (the looped "cortex", arch: cortex) and the older grid versions
+(v2/v3) are kept apart: each gets its own fitted line. thinking.png shows
+how v4's loss and reasoning accuracy change with the number of thinking
+loops, with the same-size baseline as a flat reference line.
 
     python scripts/scaling_report.py            # reads runs/*/metrics.json
 
@@ -43,8 +48,21 @@ TASKS = {
     'lambada': ('acc', True, 0.0), 'wikitext_bpb': ('bpb', False, None),
     'gsm8k_bpb': ('bpb', False, None), 'humaneval_bpb': ('bpb', False, None),
     'gsm8k': ('exact_match', True, 0.0), 'humaneval': ('pass@1', True, 0.0),
+    'var_chain': ('acc', True, 0.10), 'add2': ('acc', True, 0.25),
 }
-TIER_ORDER = {'50m': 0, '125m': 1, '350m': 2, '1b': 3}
+TIER_ORDER = {'50m': 0, '125m': 1, '150m': 2, '350m': 3, '1b': 4}
+
+
+def _line(m):
+    """Which curve a run belongs to: the baseline, Raslila v4, or the old grid."""
+    if m['family'] != 'raslila':
+        return 'baseline'
+    return 'raslila v4' if (m.get('model') or {}).get('arch') == 'cortex' else 'raslila grid (v2/v3)'
+
+
+def _labels(r, n):
+    loops = r.get('exit_loops')
+    return [str(x) for x in loops] if loops and len(loops) == n else [str(i + 1) for i in range(n)]
 
 
 def _order(runs):
@@ -66,7 +84,7 @@ def comparison_sections(runs):
     if tasks:
         out += ['', '## Benchmarks (zero-shot; gsm8k 3-shot)', '',
                 'Higher is better, except *_bpb (bits per byte: lower is better). '
-                'Bold = the better of the two models at that size. Raslila uses all its thinking cycles.', '',
+                'Bold = the better of the two models at that size. Raslila v4: read out after its test_loops (8); grid: after all cycles.', '',
                 '| task | metric | chance | ' + ' | '.join(r['run'] for r in rs) + ' |',
                 '|---|---|---|' + '---|' * len(rs)]
         for t in tasks:
@@ -77,7 +95,7 @@ def comparison_sections(runs):
                 if v is None:
                     row.append('-')
                     continue
-                mate = [o for o in rs if o['tier'] == r['tier'] and o is not r
+                mate = [o for o in rs if o['tier'] == r['tier'] and o['family'] != r['family']
                         and o['bench'].get(t, {}).get('value') is not None]
                 better = bool(mate) and ((v > mate[0]['bench'][t]['value']) if hib
                                          else (v < mate[0]['bench'][t]['value']))
@@ -88,50 +106,61 @@ def comparison_sections(runs):
     h2h = []
     for tier in sorted({r['tier'] for r in runs}, key=lambda t: TIER_ORDER.get(t, 9)):
         b = [r for r in runs if r['tier'] == tier and r['family'] == 'baseline']
-        z = [r for r in runs if r['tier'] == tier and r['family'] == 'raslila']
-        if not (b and z):
+        zs = [r for r in runs if r['tier'] == tier and r['family'] == 'raslila']
+        if not (b and zs):
             continue
-        b, z = b[0], z[0]
-        wins = losses = 0
-        for t in tasks:
-            vb, vz = b['bench'].get(t, {}).get('value'), z['bench'].get(t, {}).get('value')
-            if vb is None or vz is None or abs(vz - vb) < 1e-9:
-                continue
-            if (vz > vb) == TASKS[t][1]:
-                wins += 1
-            else:
-                losses += 1
-        h2h.append('| {} | {:.4f} | {:.4f} | {:+.4f} | {:.2f}x | {} / {} | {}{} |'.format(
-            tier, b['val_loss'], z['val_loss'], z['val_loss'] - b['val_loss'],
-            z['tokens_per_second'] / max(1e-9, b['tokens_per_second']), wins, losses,
-            'Raslila' if z['val_loss'] < b['val_loss'] else 'baseline',
-            '' if (b.get('finished') and z.get('finished')) else ' (partial runs)'))
+        b = b[0]
+        for z in sorted(zs, key=lambda r: r['run']):
+            h2h.append(_h2h_row(tier, b, z, tasks))
     if h2h:
         out += ['', '## Head to head at the same size', '',
-                'diff = Raslila minus baseline (negative = Raslila better). Under ~0.02 is noise at one size.', '',
-                '| tier | baseline val loss | Raslila val loss | diff | Raslila speed vs baseline '
-                '| benchmarks Raslila won / lost | lower val loss |',
-                '|---|---|---|---|---|---|---|'] + h2h
+                'diff = Raslila minus baseline (negative = Raslila better). Under ~0.02 is noise at one size. '
+                '"compute/token" = training FLOPs per token relative to the baseline (thinking costs compute).', '',
+                '| tier | Raslila run | params (baseline / Raslila) | baseline val loss | Raslila val loss | diff '
+                '| compute/token | benchmarks Raslila won / lost | lower val loss |',
+                '|---|---|---|---|---|---|---|---|---|'] + h2h
 
     loop = []
     for r in rs:
         if r['family'] != 'raslila':
             continue
         per = r.get('val_loss_per_cycle') or []
+        lab = _labels(r, len(per))
         if len(per) > 1:
             loop.append('| {} | validation loss | {} | {:+.4f} |'.format(
-                r['run'], ' -> '.join('{:.4f}'.format(v) for v in per), per[-1] - per[0]))
+                r['run'], '  '.join('{}:{:.4f}'.format(a, v) for a, v in zip(lab, per)), per[-1] - per[0]))
         for t in tasks:
             pc = r['bench'].get(t, {}).get('per_cycle')
             if pc and len(pc) > 1:
+                lab = [str(x) for x in (r['bench'][t].get('exit_loops') or range(1, len(pc) + 1))]
                 loop.append('| {} | {} | {} | {:+.4f} |'.format(
-                    r['run'], t, ' -> '.join(_fmt(TASKS[t][0], v) for v in pc), pc[-1] - pc[0]))
+                    r['run'], t, '  '.join('{}:{}'.format(a, _fmt(TASKS[t][0], v)) for a, v in zip(lab, pc)),
+                    pc[-1] - pc[0]))
     if loop:
-        out += ['', '## Thinking loops: does another cycle help?', '',
-                'Same model, same forward pass, read out after cycle 1, 2, ... '
-                'For loss / bpb a negative change is better; for accuracy a positive one.', '',
-                '| run | measure | cycle 1 -> last | change |', '|---|---|---|---|'] + loop
+        out += ['', '## Thinking: does more looping help?', '',
+                'Same model, read out after 1, 2, 4, ... loops (v4) or after each cycle (grid). '
+                'Each cell is loops:value. For loss / bpb a negative change is better; for accuracy a positive one. '
+                'A standard transformer cannot do this: its line would be flat. See thinking.png.', '',
+                '| run | measure | by loops | first -> last change |', '|---|---|---|---|'] + loop
     return out
+
+
+def _h2h_row(tier, b, z, tasks):
+    wins = losses = 0
+    for t in tasks:
+        vb, vz = b['bench'].get(t, {}).get('value'), z['bench'].get(t, {}).get('value')
+        if vb is None or vz is None or abs(vz - vb) < 1e-9:
+            continue
+        if (vz > vb) == TASKS[t][1]:
+            wins += 1
+        else:
+            losses += 1
+    cpt = (z['flops_seen'] / max(1, z['tokens_seen'])) / max(1e-9, b['flops_seen'] / max(1, b['tokens_seen']))
+    return '| {} | {} | {:.0f}M / {:.0f}M | {:.4f} | {:.4f} | {:+.4f} | {:.2f}x | {} / {} | {}{} |'.format(
+        tier, z['run'], b['params_total'] / 1e6, z['params_total'] / 1e6, b['val_loss'], z['val_loss'],
+        z['val_loss'] - b['val_loss'], cpt, wins, losses,
+        'Raslila' if z['val_loss'] < b['val_loss'] else 'baseline',
+        '' if (b.get('finished') and z.get('finished')) else ' (partial runs)')
 
 
 def write_csv(runs):
@@ -189,7 +218,7 @@ def plot_bench(plt, runs):
     w = 0.8 / len(rs)
     for ax, (group, title) in zip(axes[0], groups):
         for k, r in enumerate(rs):
-            shade = 0.45 + 0.55 * (TIER_ORDER.get(r['tier'], 0) + 1) / 4
+            shade = 0.45 + 0.55 * (TIER_ORDER.get(r['tier'], 0) + 1) / 5
             col = (0.30 * shade, 0.45 * shade, 0.69 * shade + 0.2) if r['family'] == 'baseline' \
                 else (0.87 * shade + 0.1, 0.52 * shade, 0.32 * shade)
             ax.bar([i + k * w for i in range(len(group))],
@@ -208,6 +237,45 @@ def plot_bench(plt, runs):
     plt.close(fig)
 
 
+def plot_thinking(plt, runs):
+    """v4: loss and accuracy vs number of thinking loops; baseline = flat line."""
+    looped = [r for r in _order(runs) if r['line'] == 'raslila v4' and r.get('exit_loops')]
+    if not looped:
+        return
+    panels = [('validation loss', None)] + [(t, t) for t in ('var_chain', 'add2', 'arc_easy', 'hellaswag',
+                                                              'gsm8k_bpb', 'wikitext_bpb')
+                                            if any(r['bench'].get(t, {}).get('per_cycle') for r in looped)]
+    fig, axes = plt.subplots(1, len(panels), figsize=(3.6 * len(panels), 3.6), squeeze=False)
+    for ax, (title, t) in zip(axes[0], panels):
+        for r in looped:
+            if t is None:
+                xs, ys = r['exit_loops'], r.get('val_loss_per_cycle') or []
+            else:
+                b = r['bench'].get(t, {})
+                xs, ys = b.get('exit_loops') or [], b.get('per_cycle') or []
+            if xs and len(xs) == len(ys):
+                ax.plot(xs, ys, 'o-', color='#dd8452', label=r['run'])
+            base = [o for o in runs if o['family'] == 'baseline' and o['tier'] == r['tier']]
+            if base:
+                bv = base[0]['val_loss'] if t is None else base[0]['bench'].get(t, {}).get('value')
+                if bv is not None:
+                    ax.axhline(bv, color='#4c72b0', ls='--', lw=1, label=base[0]['run'])
+        if t and TASKS[t][2]:
+            ax.axhline(TASKS[t][2], color='k', ls=':', lw=1, label='chance')
+        ax.set_xscale('log', base=2)
+        ticks = sorted({x for r in looped for x in (r.get('exit_loops') or [])})
+        ax.set_xticks(ticks)
+        ax.set_xticklabels([str(x) for x in ticks])
+        ax.set_xlabel('thinking loops')
+        ax.set_title(title if t is None else '{} ({})'.format(t, TASKS[t][0]), fontsize=9)
+        ax.grid(True, alpha=0.3)
+    axes[0][0].legend(fontsize=7)
+    fig.suptitle('Thinking time: Raslila v4 read out after more loops (dashed = same-size standard transformer)')
+    fig.tight_layout()
+    fig.savefig('runs/thinking.png', dpi=150)
+    plt.close(fig)
+
+
 def load_runs(pattern='runs/*/metrics.json'):
     runs = []
     for path in sorted(glob.glob(pattern)):
@@ -216,7 +284,9 @@ def load_runs(pattern='runs/*/metrics.json'):
         if m.get('data') == 'synthetic' or not m.get('val_loss'):
             continue
         m['run'] = os.path.basename(os.path.dirname(path))
-        m['tier'] = m['run'].split('_', 1)[-1]
+        parts = m['run'].split('_')
+        m['tier'] = parts[1] if len(parts) > 1 else m['run']      # raslila_150m_topo -> 150m
+        m['line'] = _line(m)
         m['bench'] = {}
         bp = os.path.join(os.path.dirname(path), 'benchmark.json')
         if os.path.exists(bp):
@@ -247,25 +317,28 @@ def main():
         print('No finished runs with real data under runs/. Train something first:\n'
               '  python run.py scale --tier 50m')
         return 1
-    lines = ['# Raslila v2 vs baseline -- scaling report', '',
-             'Generated {}. Plots: scaling.png, curves.png, benchmarks.png. Every number: compare.csv.'.format(
+    lines = ['# Raslila vs baseline -- scaling report', '',
+             'Generated {}. Plots: scaling.png, curves.png, benchmarks.png, thinking.png. Every number: compare.csv.'.format(
                  time.strftime('%Y-%m-%d %H:%M')), '',
              '## Training', '',
-             '| run | family | params | tokens | train FLOPs | val loss | loss per cycle | tok/s/GPU | MFU | GPU-h | done |',
+             '| run | model | params | tokens | train FLOPs | val loss | loss by loops / cycles | tok/s/GPU | MFU | GPU-h | done |',
              '|---|---|---|---|---|---|---|---|---|---|---|']
     for m in _order(runs):
         per = m.get('val_loss_per_cycle') or []
         lines.append('| {} | {} | {:.0f}M | {:.2f}B | {:.2e} | **{:.4f}** | {} | {:,.0f} | {} | {:.1f} | {} |'.format(
-            m['run'], m['family'], m['params_total'] / 1e6, m['tokens_seen'] / 1e9, m['flops_seen'],
-            m['val_loss'], ' / '.join('{:.3f}'.format(v) for v in per) if len(per) > 1 else '-',
+            m['run'], m['line'], m['params_total'] / 1e6, m['tokens_seen'] / 1e9, m['flops_seen'],
+            m['val_loss'], ' '.join('{}:{:.3f}'.format(a, v) for a, v in zip(_labels(m, len(per)), per))
+            if len(per) > 1 else '-',
             m['tokens_per_second'] / max(1, m['gpus']),
             '{:.1%}'.format(m['mfu']) if m.get('mfu') else 'n/a',
             m['train_seconds'] * m['gpus'] / 3600, 'yes' if m.get('finished') else 'partial'))
 
     fits = {}
-    for fam in ('baseline', 'raslila'):
-        pts = [(m['flops_seen'], m['val_loss']) for m in runs if m['family'] == fam and m.get('finished')]
-        fits[fam] = (fit(pts), len(pts))
+    for fam in ('baseline', 'raslila v4', 'raslila grid (v2/v3)'):
+        pts = [(m['flops_seen'], m['val_loss']) for m in runs if m['line'] == fam and m.get('finished')
+               and m['run'].count('_') == 1]                      # variants (e.g. _topo) are not in the fit
+        if pts or fam == 'baseline':
+            fits[fam] = (fit(pts), len(pts))
     lines += ['', '## Fit: loss = a * C^-b (finished runs only)', '']
     for fam, (f, n) in fits.items():
         if f:
@@ -274,7 +347,8 @@ def main():
         else:
             lines.append('- **{}**: needs at least 2 finished runs ({} so far)'.format(fam, n))
 
-    fb, fr = fits['baseline'][0], fits['raslila'][0]
+    fb = fits['baseline'][0]
+    fr = (fits.get('raslila v4') or (None,))[0] or (fits.get('raslila grid (v2/v3)') or (None,))[0]
     if fb and fr:
         cmax = max(m['flops_seen'] for m in runs)
         lb, lr = fb[0] * cmax ** -fb[1], fr[0] * cmax ** -fr[1]
@@ -307,9 +381,9 @@ def main():
         print('(matplotlib not installed: no plot)')
         return 0
     fig, ax = plt.subplots(figsize=(7, 4.5))
-    colors = {'baseline': '#4c72b0', 'raslila': '#dd8452'}
-    for fam in ('baseline', 'raslila'):
-        rs = [m for m in runs if m['family'] == fam]
+    colors = {'baseline': '#4c72b0', 'raslila v4': '#dd8452', 'raslila grid (v2/v3)': '#bbbbbb'}
+    for fam in colors:
+        rs = [m for m in runs if m['line'] == fam]
         if not rs:
             continue
         ax.scatter([m['flops_seen'] for m in rs], [m['val_loss'] for m in rs],
@@ -317,7 +391,7 @@ def main():
         for m in rs:
             ax.annotate('{:.0f}M'.format(m['params_total'] / 1e6), (m['flops_seen'], m['val_loss']),
                         textcoords='offset points', xytext=(4, 4), fontsize=8)
-        f = fits[fam][0]
+        f = (fits.get(fam) or (None,))[0]
         if f:
             cs = sorted(m['flops_seen'] for m in rs)
             xs = [cs[0] * (cs[-1] * 10 / cs[0]) ** (i / 50) for i in range(51)]
@@ -326,7 +400,7 @@ def main():
     ax.set_yscale('log')
     ax.set_xlabel('training FLOPs')
     ax.set_ylabel('validation loss (nats/token)')
-    ax.set_title('Raslila v2 vs standard transformer (same data, tokens, recipe)')
+    ax.set_title('Raslila vs standard transformer (same data, tokens, recipe)')
     ax.grid(True, which='both', alpha=0.3)
     ax.legend()
     fig.tight_layout()
@@ -334,7 +408,8 @@ def main():
     plt.close(fig)
     plot_curves(plt, runs)
     plot_bench(plt, runs)
-    print('saved runs/scaling_report.md, compare.csv, scaling.png, curves.png, benchmarks.png')
+    plot_thinking(plt, runs)
+    print('saved runs/scaling_report.md, compare.csv, scaling.png, curves.png, benchmarks.png, thinking.png')
     return 0
 
 

@@ -37,6 +37,7 @@ import yaml
 
 from raslila.grid import RaslilaGrid, GridConfig
 from raslila.baseline import Baseline, BaselineConfig
+from raslila.cortex import RaslilaCortex, CortexConfig
 
 PEAK = {'A100': 312e12, 'H100': 989e12, 'H200': 989e12, 'B200': 2250e12, 'L40': 181e12,
         'A10': 125e12, '4090': 165e12, '3090': 71e12}
@@ -55,7 +56,10 @@ def peak_flops(device):
 def build_model(mcfg):
     mcfg = dict(mcfg)
     family = mcfg.pop('family')
+    if family == 'raslila' and mcfg.get('arch') == 'cortex':
+        return RaslilaCortex(CortexConfig(**mcfg))
     if family == 'raslila':
+        mcfg.pop('arch', None)
         return RaslilaGrid(GridConfig(**mcfg))
     if family == 'baseline':
         return Baseline(BaselineConfig(**mcfg))
@@ -145,8 +149,10 @@ def main():
     model = build_model(cfg['model']).to(device)
     family = model.family
     total_params, nonembed = param_counts(model)
-    adaptive = family == 'raslila' and model.config.max_think_cycles > 0
+    looped = bool(getattr(model, 'looped', False))          # v4 cortex
+    adaptive = family == 'raslila' and not looped and model.config.max_think_cycles > 0
     max_cycles = model.config.max_think_cycles if adaptive else 0
+    eval_loops = sorted(set(model.config.eval_loops) | {model.config.test_loops}) if looped else None
 
     micro = int(args.micro_batch or tr['micro_batch'])
     batch_tokens = int(float(tr['batch_tokens']))
@@ -211,7 +217,9 @@ def main():
         log('Already finished ({} >= {} steps).'.format(start_step, steps))
 
     raw = model
-    if args.compile:
+    if args.compile and looped:
+        raw.compile_blocks()          # per layer: the loop count changes every step
+    elif args.compile:
         if ddp:
             # DDP's graph splitter ("DDPOptimizer") cannot handle activation
             # checkpointing (a higher-order op) and crashes. Gradients are
@@ -220,7 +228,7 @@ def main():
             torch._dynamo.config.optimize_ddp = False
         model = torch.compile(model)
     if ddp:
-        find_unused = family == 'raslila' and (adaptive or model_depth_sweeps(raw) == 1)
+        find_unused = family == 'raslila' and not looped and (adaptive or model_depth_sweeps(raw) == 1)
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local], find_unused_parameters=find_unused)
 
@@ -239,7 +247,16 @@ def main():
     log('=' * 78)
     log('{} | {}'.format(family.upper(), args.config))
     log('params {:,} total, {:,} non-embedding'.format(total_params, nonembed))
-    if family == 'raslila':
+    if looped:
+        c = raw.config
+        log('cortex: prelude {} + core {} (looped, mean {} loops, max {} in training, backprop through last {}) '
+            '+ coda {} | d {} | cube {} | test loops {} | topo weight {}'.format(
+                c.n_prelude, c.n_core, c.mean_loops, c.max_train_loops, c.backprop_loops, c.n_coda,
+                c.d_model, c.cube_shape, c.test_loops, c.topo_weight))
+        log('expected training FLOPs/token {:.3g} (a same-size standard model: ~{:.3g})'.format(
+            raw.expected_flops_per_token(seq_len),
+            3 * ((c.n_prelude + c.n_core + c.n_coda) * raw._layer_flops(seq_len) + 2 * c.d_model * c.vocab_size)))
+    elif family == 'raslila':
         c = raw.config
         log('grid {} x {} x {} = {} blocks, d_node {}, node_depth {}, {}'.format(
             *c.grid_shape, raw.L * raw.N, c.d_node, c.node_depth,
@@ -251,18 +268,33 @@ def main():
     log('=' * 78)
 
     # ---- eval ---------------------------------------------------------------------
+    health = {}
+
     def evaluate():
         raw.eval()
         rng = np.random.default_rng(999)                # same windows for every model
-        n_ex = max_cycles if adaptive else 1
+        n_ex = len(eval_loops) if looped else (max_cycles if adaptive else 1)
         sums = [0.0] * n_ex
+        health['state_sim'] = None
         with torch.no_grad(), torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-            for _ in range(eval_batches):
+            for bi in range(eval_batches):
                 offs = rng.integers(0, val_tokens - seq_len - 1, size=micro)
                 arr = np.stack([np.asarray(tokens[o:o + seq_len + 1], dtype=np.int64) for o in offs])
                 t = torch.from_numpy(arr).to(device)
-                out = raw(t[:, :-1], think_cycles=max_cycles if adaptive else None, halt=False) \
-                    if adaptive else raw(t[:, :-1])
+                if looped:
+                    out = raw(t[:, :-1], exit_at=eval_loops, return_state=(bi == 0))
+                    if bi == 0:
+                        # Huginn's collapse signal: if every token's thinking state
+                        # becomes the same vector, the model has stopped working.
+                        st = out['state'].float().reshape(-1, out['state'].size(-1))
+                        st = st[torch.randperm(st.size(0), device=st.device)[:512]]
+                        st = F.normalize(st - st.mean(0), dim=-1)
+                        sim = (st @ st.t()).abs()
+                        health['state_sim'] = float((sim.sum() - sim.diagonal().sum()) / (sim.numel() - sim.size(0)))
+                elif adaptive:
+                    out = raw(t[:, :-1], think_cycles=max_cycles, halt=False)
+                else:
+                    out = raw(t[:, :-1])
                 for k, ex in enumerate(out['exit_logits']):
                     sums[k] += F.cross_entropy(ex.float().reshape(-1, ex.size(-1)),
                                                t[:, 1:].reshape(-1), ignore_index=0).item()
@@ -292,6 +324,7 @@ def main():
              'steps_done': step, 'steps_total': steps, 'finished': final,
              'val_loss': last['val_loss'] if last else None,
              'val_loss_per_cycle': last['val_per_cycle'] if last else None,
+             'exit_loops': eval_loops, 'test_loops': raw.config.test_loops if looped else None,
              'history': history, 'data': data_info if not args.synthetic else 'synthetic'}
         with open(os.path.join(out_dir, 'metrics.json'), 'w', encoding='utf-8') as f:
             json.dump(m, f, indent=2)
@@ -313,6 +346,8 @@ def main():
         for g in opt.param_groups:
             g['lr'] = lr_at(step)
         cycles = random.Random(seed * 7919 + step).randint(1, max_cycles) if adaptive else None
+        # v4: one loop count per step, identical on every GPU (Huginn's locked-step sampling)
+        loops = raw.sample_train_loops(random.Random(seed * 7919 + step)) if looped else None
         step_loss = 0.0
         step_flops = 0.0
         for micro_i in range(accum):
@@ -322,7 +357,12 @@ def main():
             ctx = model.no_sync() if (ddp and not sync) else _null()
             with ctx:
                 with torch.autocast('cuda', dtype=torch.bfloat16, enabled=use_amp):
-                    out = model(x, think_cycles=cycles) if adaptive else model(x)
+                    if looped:
+                        out = model(x, loops=loops)
+                    elif adaptive:
+                        out = model(x, think_cycles=cycles)
+                    else:
+                        out = model(x)
                     exits = out['exit_logits']
                     ce, zl = [], []
                     for e in exits:
@@ -332,9 +372,13 @@ def main():
                             zl.append(torch.logsumexp(ef, dim=-1).pow(2).mean())
                     task_loss = torch.stack(ce).mean()
                     loss = task_loss + (z_loss * torch.stack(zl).mean() if zl else 0.0)
+                    if 'aux_loss' in out:
+                        loss = loss + out['aux_loss']
                 (loss / accum).backward()
             step_loss += task_loss.item() / accum          # logged loss = cross-entropy only
-            if family == 'raslila':
+            if looped:
+                step_flops += raw.flops_per_token(seq_len, sweeps=out['sweeps']) * x.numel()
+            elif family == 'raslila':
                 step_flops += raw.flops_per_token(seq_len, sweeps=out['sweeps'],
                                                   exits=len(exits)) * x.numel()
             else:
@@ -364,9 +408,9 @@ def main():
         if step % eval_every == 0 or step == steps:
             per = evaluate() if main_proc else None
             if main_proc:
-                val = per[-1]
+                val = per[eval_loops.index(raw.config.test_loops)] if looped else per[-1]
                 history.append({'step': step, 'tokens': tokens_seen, 'flops': flops_seen,
-                                'val_loss': val, 'val_per_cycle': per,
+                                'val_loss': val, 'val_per_cycle': per, 'state_sim': health.get('state_sim'),
                                 'train_loss': win_loss / max(1, win_n)})
                 write_metrics(final=(step == steps))
             if ddp:
@@ -385,6 +429,15 @@ def main():
                 msg += ' | VAL {:.4f}'.format(val)
                 if adaptive:
                     msg += ' (per cycle: ' + ' '.join('{:.3f}'.format(v) for v in per) + ')'
+                elif looped:
+                    msg += ' at {} loops (by loops: '.format(raw.config.test_loops) + ' '.join(
+                        '{}:{:.3f}'.format(r, v) for r, v in zip(eval_loops, per)) + ')'
+                    if health.get('state_sim') is not None:
+                        msg += ' | state sim {:.2f}'.format(health['state_sim'])
+                        if health['state_sim'] > 0.9:
+                            msg += ' WARNING: thinking state collapsing (Huginn bad run 1) -- lower train.lr'
+                    if len(per) > 1 and step >= 1000 and per[0] - per[-1] < 0.005:
+                        msg += ' WARNING: more loops do not help (Huginn bad run 2: model ignores its loops)'
             log(msg)
             if main_proc:
                 with open(csv_path, 'a', newline='') as f:

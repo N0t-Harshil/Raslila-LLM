@@ -54,7 +54,9 @@ def main():
             total, ne = param_counts(m)
             counts[fam] = total
             seq = int(cfg['train']['seq_len'])
-            if fam == 'raslila' and m.config.max_think_cycles > 0:
+            if getattr(m, 'looped', False):
+                fpt = m.expected_flops_per_token(seq)
+            elif fam == 'raslila' and m.config.max_think_cycles > 0:
                 # training samples 1..max cycles uniformly: average sweeps and exits
                 k = m.config.max_think_cycles
                 fpt = sum(m.flops_per_token(seq, sweeps=m.sweeps_for_cycles(c), exits=c)
