@@ -143,8 +143,15 @@ def main():
             print('{:<10} {:>8.1f} {:>16.3f} {:>18.3f}'.format(name, pr, sr, ctrl))
         prs = [s['participation_ratio'] for s in res['stages']]
         res['pr_last_over_first'] = prs[-1] / max(1e-9, prs[0])
-        print('PR last/first stage: {:.2f}x (mouse cortex top/bottom ~2.25x; HRM ~3x). '
-              'spatial r well above the shuffled control (~0) = brain-like 3D clustering.'.format(res['pr_last_over_first']))
+        ratio = res['pr_last_over_first']
+        best_sr = max(s['spatial_r'] for s in res['stages'])
+        noise = max(abs(s['spatial_r_shuffled']) for s in res['stages'])
+        res['hierarchy_brain_like'] = ratio >= 1.5
+        res['spatial_brain_like'] = best_sr > max(0.02, 3 * noise)
+        print('PR last/first stage: {:.2f}x -> {} (brain-like = rises with depth; mouse cortex ~2.25x, HRM ~3x)'.format(
+            ratio, 'brain-like' if res['hierarchy_brain_like'] else 'NOT brain-like'))
+        print('best spatial r {:.3f} vs shuffled noise {:.3f} -> {} 3D clustering'.format(
+            best_sr, noise, 'brain-like' if res['spatial_brain_like'] else 'NO'))
         with open(os.path.join('runs', run, 'brain.json'), 'w', encoding='utf-8') as f:
             json.dump(res, f, indent=2)
         print('  -> runs/{}/brain.json'.format(run))
