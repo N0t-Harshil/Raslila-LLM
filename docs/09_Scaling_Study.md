@@ -209,6 +209,45 @@ learned router reaches loss 0.04 versus 0.54 for v2-style fixed averaging.
 Whether this closes the gap on language is what the 50m/125m rerun measures;
 the decision rules below are unchanged.
 
+## Result 2: v4 (cortex) at 150m (2026-11-11)
+
+Same data, tokens (3.2B), lr, batch and 3 GPUs as `baseline_150m`.
+
+| | baseline_150m | raslila_150m (v4) |
+|---|---|---|
+| params | 160M | 162M |
+| val loss | 2.5929 | **2.5464** (-0.047) |
+| training FLOPs / token | 1.09e9 | 2.42e9 (2.22x) |
+| GPU-hours (MFU) | 15.2 (20%) | 22.8 (30%) |
+
+- **Equal parameters: Raslila wins.** First version to beat the baseline. Clear benchmark gains
+  (beyond noise): LAMBADA 24.6 vs 22.0, ARC-easy 50.4 vs 47.8, all three bits-per-byte sets.
+  HellaSwag/SciQ lean Raslila but sit inside noise; the rest is noise. add2 is below chance for both.
+- **Loops are used, up to 4:** val loss 1: 2.640, 2: 2.560, 4: 2.547, 8: 2.546, 16: 2.546. The state is a
+  fixed point from loop ~3 on (participation ratio identical for loops 3-16).
+- **Equal compute: not yet shown.** The baseline fit (3 runs) projects ~2.41 for a standard model with
+  Raslila's training compute. Measured next with `baseline_150m_iso`.
+- **Brain metrics: negative.** Spatial r = 0.000 (no 3D clustering; the topo loss was off) and the
+  participation ratio falls toward the output (0.55x) instead of rising.
+- Bug fixed before this run (`3a2f4e3`): under bf16 autocast the no-grad loops cached weight casts
+  without autograd links, so the core got no gradient on steps with more than 4 loops.
+
+### Next runs, in this order (`COMMANDS.md` 4c)
+
+| # | run | question | ~time on 3 A100 |
+|---|---|---|---|
+| 1 | `raslila_50m` (v4, 43M) vs `baseline_50m` | does the equal-size win hold at a 2nd size? | 1.5 h |
+| 2 | `baseline_150m_iso` (25 layers, 350M, same FLOPs/token as v4) | the measured equal-compute target | 10 h |
+| 3 | `raslila_150m_lean` (mean 3 loops, backprop 2, test 4: 1.6x compute) | can Raslila close the compute gap? | 6 h |
+| 4 | `raslila_150m_topo` (3D brain-region loss 0.5) | does the cube become brain-like, at what cost? | 8.5 h |
+
+**Decision rules (fixed before seeing the results).** The report's "Equal training compute" table reads
+the baseline loss at each Raslila run's FLOPs/token from baseline_150m + baseline_150m_iso (same tokens).
+- diff <= 0: **it works at equal compute** -- claim it.
+- 0 < diff <= +0.03: parity within noise; claim "same quality with half the parameters".
+- diff > +0.03: claim stays "better at equal size, costs more training compute".
+- topo: brain-like if spatial r is clearly above the shuffled control; keep it only if it costs < 0.03 val loss.
+
 ## Decision rules (fixed before seeing the results)
 
 1. **Speed gate (day 1).** `run.py speed`: if Raslila v2 runs at less than

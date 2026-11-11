@@ -1,0 +1,26 @@
+# EQUAL-COMPUTE baseline for raslila_150m: a standard transformer that spends the
+# same training FLOPs per token as Raslila v4 (by being 2.5x deeper), on the same
+# 3.2B tokens. If Raslila (162M) matches this (350M), loops = free parameters.
+model:
+  family: baseline
+  vocab_size: 32768
+  d_model: 1024
+  n_layers: 25            # 350M params: same training FLOPs/token as Raslila v4 (~2.4e9)
+  n_heads: 16
+  activation_checkpoint: false
+train:
+  tokens: 3.2e9           # SAME token budget for both families (~20 tokens/param)
+  seq_len: 1024
+  batch_tokens: 524288    # 0.5M tokens per optimizer step
+  micro_batch: 16         # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  lr: 3.0e-4              # the study's tuned recipe for a 24-layer model (baseline_350m)
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_every: 250
+  eval_batches: 40
+  log_every: 10
+  save_every_minutes: 30
+  seed: 1234
+data: configs/data.yaml
+out_dir: runs/baseline_150m_iso

@@ -1,0 +1,36 @@
+# Variant of raslila_150m: LEAN thinking schedule. The 150m run showed loss
+# saturates at 4 loops, so train with fewer loops and a shorter backward.
+# Training compute 1.74e9 FLOPs/token (v4: 2.4e9, baseline: 1.09e9) -> ~1.6x baseline.
+model:
+  family: raslila
+  arch: cortex
+  vocab_size: 32768
+  d_model: 1024
+  n_heads: 16
+  n_prelude: 2
+  n_core: 6               # looped: effective depth 2 + 6 x loops + 2
+  n_coda: 2
+  cube_shape: [8, 8, 16]
+  mean_loops: 3           # 150m run: loss stopped improving after 4 loops -> train cheaper
+  max_train_loops: 8
+  backprop_loops: 2       # gradients through the last 2 loops only (cheaper backward)
+  test_loops: 4           # 150m run: 4 loops = 8 loops, so read out after 4 (half the inference cost)
+  eval_loops: [1, 2, 4, 8, 16]
+  topo_weight: 0.0        # 3D brain-region loss: off here, its own experiment (raslila_150m_topo)
+  activation_checkpoint: false
+train:
+  tokens: 3.2e9
+  seq_len: 1024
+  batch_tokens: 524288
+  micro_batch: 16         # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  lr: 5.0e-4
+  min_lr_frac: 0.1
+  weight_decay: 0.1
+  grad_clip: 1.0
+  eval_every: 250
+  eval_batches: 40
+  log_every: 10
+  save_every_minutes: 30
+  seed: 1234
+data: configs/data.yaml
+out_dir: runs/raslila_150m_lean

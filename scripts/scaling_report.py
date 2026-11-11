@@ -77,6 +77,46 @@ def _fmt(metric, v):
     return '{:.4f}'.format(v) if metric == 'bpb' else '{:.1%}'.format(v)
 
 
+def _plain_baseline(runs, tier):
+    b = [r for r in runs if r['tier'] == tier and r['family'] == 'baseline']
+    b.sort(key=lambda r: (r['run'] != 'baseline_' + tier, r['run']))
+    return b[0] if b else None
+
+
+def equal_compute_rows(runs):
+    """Measured equal-compute check: in each tier, finished baselines trained on the
+    same tokens but at different depths give loss vs training FLOPs/token. Read the
+    baseline loss off that line (log-linear) at each Raslila run's FLOPs/token."""
+    rows = []
+    fpt = lambda r: r['flops_seen'] / max(1, r['tokens_seen'])
+    for tier in sorted({r['tier'] for r in runs}, key=lambda t: TIER_ORDER.get(t, 9)):
+        zs = [r for r in runs if r['tier'] == tier and r['family'] == 'raslila' and r.get('finished')]
+        for z in sorted(zs, key=lambda r: r['run']):
+            bs = sorted([r for r in runs if r['tier'] == tier and r['family'] == 'baseline' and r.get('finished')
+                         and abs(r['tokens_seen'] / max(1, z['tokens_seen']) - 1) < 0.05], key=fpt)
+            if len(bs) < 2:
+                continue
+            x = math.log(fpt(z))
+            lo = [b for b in bs if fpt(b) <= fpt(z)]
+            hi = [b for b in bs if fpt(b) > fpt(z)]
+            b1, b2 = (lo[-1], hi[0]) if (lo and hi) else ((bs[-2], bs[-1]) if not hi else (bs[0], bs[1]))
+            x1, x2 = math.log(fpt(b1)), math.log(fpt(b2))
+            lb = b1['val_loss'] + (b2['val_loss'] - b1['val_loss']) * (x - x1) / (x2 - x1)
+            rows.append('| {} | {} | {:.2f}x | {:.4f} | {:.4f} | {:+.4f} | {} | {} |'.format(
+                tier, z['run'], fpt(z) / fpt(bs[0]), lb, z['val_loss'], z['val_loss'] - lb,
+                ' vs '.join('{} ({:.0f}M, {:.4f})'.format(b['run'], b['params_total'] / 1e6, b['val_loss']) for b in (b1, b2)),
+                ('Raslila' if z['val_loss'] < lb else 'baseline') +
+                ('' if (fpt(bs[0]) / 1.05 <= fpt(z) <= fpt(bs[-1]) * 1.05) else ' (extrapolated)')))
+    if not rows:
+        return []
+    return ['', '## Equal training compute (measured, no scaling-law fit)', '',
+            'Baselines of the same tier trained on the same tokens at different depths give baseline loss as a '
+            'function of training FLOPs per token; it is read at each Raslila run FLOPs per token. diff = Raslila '
+            'minus that baseline (negative = Raslila better at EQUAL training compute).', '',
+            '| tier | Raslila run | its compute/token | baseline loss at that compute | Raslila val loss | diff '
+            '| from baselines | better at equal compute |', '|---|---|---|---|---|---|---|---|'] + rows
+
+
 def comparison_sections(runs):
     out = []
     tasks = _tasks(runs)
@@ -95,8 +135,10 @@ def comparison_sections(runs):
                 if v is None:
                     row.append('-')
                     continue
-                mate = [o for o in rs if o['tier'] == r['tier'] and o['family'] != r['family']
-                        and o['bench'].get(t, {}).get('value') is not None]
+                pb = _plain_baseline(rs, r['tier'])
+                mate = ([pb] if r['family'] != 'baseline' else
+                        [o for o in rs if o['tier'] == r['tier'] and o['family'] == 'raslila'] if r is pb else [])
+                mate = [o for o in mate if o and o['bench'].get(t, {}).get('value') is not None]
                 better = bool(mate) and ((v > mate[0]['bench'][t]['value']) if hib
                                          else (v < mate[0]['bench'][t]['value']))
                 row.append(('**{}**' if better else '{}').format(_fmt(metric, v)))
@@ -105,11 +147,10 @@ def comparison_sections(runs):
 
     h2h = []
     for tier in sorted({r['tier'] for r in runs}, key=lambda t: TIER_ORDER.get(t, 9)):
-        b = [r for r in runs if r['tier'] == tier and r['family'] == 'baseline']
+        b = _plain_baseline(runs, tier)
         zs = [r for r in runs if r['tier'] == tier and r['family'] == 'raslila']
         if not (b and zs):
             continue
-        b = b[0]
         for z in sorted(zs, key=lambda r: r['run']):
             h2h.append(_h2h_row(tier, b, z, tasks))
     if h2h:
@@ -142,6 +183,7 @@ def comparison_sections(runs):
                 'Each cell is loops:value. For loss / bpb a negative change is better; for accuracy a positive one. '
                 'A standard transformer cannot do this: its line would be flat. See thinking.png.', '',
                 '| run | measure | by loops | first -> last change |', '|---|---|---|---|'] + loop
+    out += equal_compute_rows(runs)
     return out
 
 
@@ -255,7 +297,7 @@ def plot_thinking(plt, runs):
                 xs, ys = b.get('exit_loops') or [], b.get('per_cycle') or []
             if xs and len(xs) == len(ys):
                 ax.plot(xs, ys, 'o-', color='#dd8452', label=r['run'])
-            base = [o for o in runs if o['family'] == 'baseline' and o['tier'] == r['tier']]
+            base = [b for b in [_plain_baseline(runs, r['tier'])] if b]
             if base:
                 bv = base[0]['val_loss'] if t is None else base[0]['bench'].get(t, {}).get('value')
                 if bv is not None:

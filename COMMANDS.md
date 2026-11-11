@@ -56,6 +56,22 @@ CUDA_VISIBLE_DEVICES=0,1,3 python run.py study
 Keep the same GPUs for the whole study. If all 4 are free, drop the `CUDA_VISIBLE_DEVICES=...` part.
 Add `--run-code` to include HumanEval pass@1 (runs model-written Python). `--no-compile` turns compile off.
 
+### 4c. The proof runs (2026-11-11): second size, equal compute, lean, brain regions
+
+One command trains all four in order (~26 h + ~1 h benchmarks). Finished runs are skipped,
+so if it stops, run the same command again.
+
+```bash
+cd ~/work/shared/Raslila-LLM && git pull && source ~/raslila-fast/bin/activate
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 50m
+CUDA_VISIBLE_DEVICES=0,1,3 python run.py study --tiers 50m,150m     --variant baseline_150m_iso --variant raslila_150m_lean --variant raslila_150m_topo
+python run.py brain --run raslila_150m_topo --run raslila_150m_lean --run raslila_50m
+cat runs/scaling_report.md
+```
+
+Read "Head to head at the same size" and "Equal training compute" in `runs/scaling_report.md`;
+the decision rules are in docs/09 (Result 2).
+
 ### 4a. Raslila v4 at 150m (current, 2026-11-09): the 3D cortex that thinks in loops
 Design and the papers behind it: docs/10_Research_and_v4_Design.md. Model: src/raslila/cortex.py.
 160M baseline vs 162M Raslila v4 (same parameters; v4 spends ~2.2x compute per token by looping).

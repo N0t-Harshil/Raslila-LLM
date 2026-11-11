@@ -1,31 +1,28 @@
-# Scaling study, tier 50m: RASLILA v2 (3D grid, thinking loops).
-# Pair: configs/scaling/baseline_50m.yaml (same data, tokens, lr, batch).
-# Training samples 1 or 2 thinking cycles per step (1 cycle = one bottom-up
-# sweep, 2 = up, down through feedback, up again) and supervises both exits;
-# eval reports the loss after each cycle. Compute is measured, not assumed.
+# Scaling study, tier 50m: RASLILA v4 (the 150m recipe, scaled down).
+# Pair: configs/scaling/baseline_50m.yaml -- same params (~42M), data, tokens, lr, batch.
+# (The v2/v3 grid config this replaced is in git history; its runs are in runs/v3/.)
 model:
   family: raslila
+  arch: cortex
   vocab_size: 32768
-  grid_shape: [3, 3, 3]
-  d_node: 192
-  n_heads: 3
-  node_depth: 2
-  d_embed: 512
-  max_think_cycles: 2
-  routing: true          # v3: per token, each block picks which neighbours to listen to
-  msg_rank: 0            # routed channel width; 0 = d_node/4 (cheap connections)
-  depth_sweeps: 2
-  lateral: true
-  feedback: true
-  long_range_prob: 0.1
-  max_long_range: 3
-  connectivity_seed: 42
-  activation_checkpoint: false   # measured 1.28x faster on A100 (fits at this micro_batch); same results
+  d_model: 512
+  n_heads: 8
+  n_prelude: 2
+  n_core: 4               # looped: effective depth 2 + 4 x loops + 2 (baseline_50m: 8 layers)
+  n_coda: 2
+  cube_shape: [8, 8, 8]
+  mean_loops: 4           # random loop count per step (log-normal Poisson, Huginn)
+  max_train_loops: 16
+  backprop_loops: 4       # gradients through the last 4 loops only
+  test_loops: 8           # headline number is read out after 8 loops
+  eval_loops: [1, 2, 4, 8, 16]
+  topo_weight: 0.0        # 3D brain-region loss: off here, its own experiment (raslila_150m_topo)
+  activation_checkpoint: false
 train:
-  tokens: 1.0e9           # SAME token budget for both families in this tier (~20 tokens/param)
+  tokens: 1.0e9
   seq_len: 1024
-  batch_tokens: 524288    # 0.5M tokens per optimizer step (GPT-3 recipe)
-  micro_batch: 16      # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
+  batch_tokens: 524288
+  micro_batch: 32         # per GPU; lower it on OOM (accumulation keeps batch_tokens fixed)
   lr: 8.0e-4
   min_lr_frac: 0.1
   weight_decay: 0.1
