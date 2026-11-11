@@ -234,6 +234,11 @@ class RaslilaCortex(nn.Module):
                     for _ in range(n_free):
                         s = self._loop(s, e.detach(), cos, sin)
                 s = s.detach()
+                # Autocast caches the bf16 copy of each weight on first use and
+                # reuses it for the rest of the region. A copy made under no_grad
+                # has no autograd link, so the loops below would give the core and
+                # adapter NO gradient (DDP then fails with "did not receive grad").
+                torch.clear_autocast_cache()
             for _ in range(loops - n_free):
                 s = self._loop(s, e, cos, sin)
             exits.append(self._readout(s, cos, sin))
