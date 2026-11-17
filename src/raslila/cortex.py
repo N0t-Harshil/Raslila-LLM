@@ -252,6 +252,45 @@ class RaslilaCortex(nn.Module):
             out['state'] = s
         return out
 
+    # ---- per-token adaptive thinking ------------------------------------------------
+    @torch.no_grad()
+    def adaptive_forward(self, idx, threshold, cap=None, min_loops=1):
+        """Each token decides for itself how many loops it needs.
+
+        After every loop, a token whose state moved less than `threshold`
+        (relative change ||s_r - s_{r-1}|| / ||s_{r-1}||) is DONE: its state is
+        frozen from then on, so later tokens still attend to it, but it is not
+        updated again. A token that is still changing keeps looping, up to `cap`.
+        The check costs nothing extra (no readout per loop). Stops early once
+        every token is done.
+
+        Returns logits and `loops_used` [B, T]. Compute is reported as loops
+        actually used per token; this dense implementation still runs the core on
+        frozen tokens, so the wall-clock saving needs gather-based execution (or
+        token-by-token generation, where it is natural)."""
+        cfg = self.config
+        cap = int(cap or cfg.max_train_loops)
+        B, T = idx.shape
+        cos, sin = rope_tables(T, cfg.d_model // cfg.n_heads, cfg.rope_theta, idx.device)
+        e = self._run(self.prelude, self.tok_emb(idx), cos, sin)
+        gen = torch.Generator(device='cpu').manual_seed(1234)
+        s = torch.randn(e.shape, generator=gen).to(e.device, e.dtype) * cfg.init_state_std
+        done = torch.zeros(B, T, dtype=torch.bool, device=idx.device)
+        used = torch.zeros(B, T, dtype=torch.long, device=idx.device)
+        for r in range(1, cap + 1):
+            new = self._loop(s, e, cos, sin)
+            used += (~done).long()
+            if r > 1:
+                delta = (new.float() - s.float()).norm(dim=-1) / (s.float().norm(dim=-1) + 1e-6)
+                s = torch.where(done.unsqueeze(-1), s, new)
+                if r >= min_loops:
+                    done |= delta < threshold
+            else:
+                s = new
+            if bool(done.all()):
+                break
+        return {'logits': self._readout(s, cos, sin), 'loops_used': used}
+
     # ---- 3D spatial smoothness (TopoLM, arXiv 2410.11516, eq. 1) -------------------
     def unit_coords(self):
         sh = self.config.cube_shape

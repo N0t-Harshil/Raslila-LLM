@@ -363,6 +363,13 @@ def cmd_brain(a):
     return run(cmd, 'brain')
 
 
+def cmd_adaptive(a):
+    cmd = [PY, 'scripts/adaptive_eval.py']
+    for r in a.run:
+        cmd += ['--run', r]
+    return run(cmd, 'adaptive')
+
+
 def cmd_status(a):
     banner('Status of every model (runs/)')
     print('{:<16} {:>9} {:>13} {:>9} {:>11} {:>8}  {}'.format(
@@ -473,6 +480,8 @@ def main():
     p.add_argument('--run-code', action='store_true', help='include HumanEval pass@1 (executes model code)')
     p.add_argument('--force', action='store_true', help='re-score even if cached')
     p = add('brain', cmd_brain, 'brain-likeness of a trained model: dimensionality hierarchy + 3D clustering')
+    p.add_argument('--run', action='append', required=True, help='e.g. raslila_150m (repeatable)')
+    p = add('adaptive', cmd_adaptive, 'per-token adaptive thinking: loops each token really needs, and the quality kept')
     p.add_argument('--run', action='append', required=True, help='e.g. raslila_150m (repeatable)')
     p = add('gpucheck', cmd_gpucheck, '2-minute check that multi-GPU (+ compile) training works')
     p.add_argument('--tier', default='125m', choices=TIERS)

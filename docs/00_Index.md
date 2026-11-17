@@ -16,6 +16,7 @@ Original quantum research notes (15 files) are archived untouched in `../docs_or
 | [06 Known Limitations](06_Known_Limitations.md) | What doesn't work; what 5T would actually require |
 | [**07 Brain Gap Analysis**](07_Brain_Gap_Analysis.md) | **What a real brain has that Raslila doesn't — 13 gaps, bad analogies, a prioritised roadmap, and a measured "can it work like a brain?" check** |
 | [**09 Scaling Study**](09_Scaling_Study.md) | **START HERE (2026-11).** Measured state of v1, the NaN fix, Raslila v2 (fast grid), the baseline, the general+math+code data, the 4-GPU study, and the decision rules |
+| [**11 Raslila v4 Complete**](11_Raslila_v4_Complete.md) | **Current model (2026-11-17): full architecture breakdown, training, inference compute, all measured results, what can be claimed, adaptive thinking** |
 | [08 Runbook (v1, finished)](08_Runbook_Bidirectional_Test.md) | **Commands for the current experiment: train A/B, compare, sample, then activate the next candidate one at a time** |
 
 Legacy top-level docs are retained and still accurate in spirit: `../README.md`,

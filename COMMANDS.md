@@ -67,6 +67,8 @@ CUDA_VISIBLE_DEVICES=0,1,3 python run.py gpucheck --tier 50m
 CUDA_VISIBLE_DEVICES=0,1,3 python run.py study --tiers 50m,150m     --variant baseline_150m_iso --variant raslila_150m_lean --variant raslila_150m_topo
 python run.py brain --run raslila_150m_topo --run raslila_150m_lean --run raslila_50m
 cat runs/scaling_report.md
+# per-token adaptive thinking (no training, minutes): loops each token really needs
+CUDA_VISIBLE_DEVICES=0 python run.py adaptive --run raslila_150m --run raslila_150m_lean --run raslila_150m_topo
 ```
 
 Read "Head to head at the same size" and "Equal training compute" in `runs/scaling_report.md`;

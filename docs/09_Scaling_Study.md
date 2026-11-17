@@ -225,8 +225,8 @@ Same data, tokens (3.2B), lr, batch and 3 GPUs as `baseline_150m`.
   HellaSwag/SciQ lean Raslila but sit inside noise; the rest is noise. add2 is below chance for both.
 - **Loops are used, up to 4:** val loss 1: 2.640, 2: 2.560, 4: 2.547, 8: 2.546, 16: 2.546. The state is a
   fixed point from loop ~3 on (participation ratio identical for loops 3-16).
-- **Equal compute: not yet shown.** The baseline fit (3 runs) projects ~2.41 for a standard model with
-  Raslila's training compute. Measured next with `baseline_150m_iso`.
+- **Equal compute: not yet shown.** The baseline fit (3 runs) projected ~2.41 for a standard model with
+  Raslila's training compute. Measured in Result 3: 2.508 (the fit was too pessimistic for Raslila).
 - **Brain metrics: negative.** Spatial r = 0.000 (no 3D clustering; the topo loss was off) and the
   participation ratio falls toward the output (0.55x) instead of rising.
 - Bug fixed before this run (`3a2f4e3`): under bf16 autocast the no-grad loops cached weight casts
@@ -247,6 +247,36 @@ the baseline loss at each Raslila run's FLOPs/token from baseline_150m + baselin
 - 0 < diff <= +0.03: parity within noise; claim "same quality with half the parameters".
 - diff > +0.03: claim stays "better at equal size, costs more training compute".
 - topo: brain-like if spatial r is clearly above the shuffled control; keep it only if it costs < 0.03 val loss.
+
+## Result 3: the proof runs (2026-11-17)
+
+| run | params | FLOPs/token vs baseline_150m | val loss | same-size diff | equal-compute diff |
+|---|---|---|---|---|---|
+| baseline_50m / raslila_50m | 42M / 43M | 1.86x (50m tier) | 3.1395 / 3.1471 | +0.008 (tie) | not measured |
+| baseline_150m | 160M | 1.00x | 2.5929 | | |
+| baseline_150m_iso | 350M | 2.22x | **2.5082** | | |
+| raslila_150m | 162M | 2.22x | 2.5464 | -0.047 | **+0.038** |
+| raslila_150m_lean | 162M | 1.61x | 2.5663 | -0.027 | **+0.024** |
+| raslila_150m_topo | 162M | 2.22x | 2.5637 | -0.029 | +0.056 |
+
+Verdicts under the rules above:
+- **Equal compute: the standard transformer wins.** A 350M baseline with v4's training FLOPs reaches
+  2.508 vs 2.546. v4 does not "work at equal compute".
+- **Lean v4 is in the parity band (+0.024 <= 0.03):** at 1.61x compute it is within noise of the
+  (interpolated, not trained) baseline of that compute, with 162M params instead of ~250M.
+  Claim: "near-equal quality with fewer parameters". Inference: lean v4 at 4 loops runs 28 block
+  passes vs 25 for the 350M baseline, so the saving is memory/parameters, not FLOPs.
+- **Size trend:** same-size diff +0.008 at 50m, -0.047 at 150m. Two points; needs a third size.
+- **Topo: 3D clustering is real and cheap.** Spatial r 0.382 in every loop vs 0.003 shuffled
+  (lean/50m/no-topo: 0.000). Cost vs raslila_150m: +0.017 val loss (< 0.03): **keep**. It is
+  induced by the topo loss (as in TopoLM), not emergent.
+- **Dimensionality hierarchy: negative for every v4 run** (PR last/first 0.52-0.74x). The plain
+  baseline_50m measures 1.95x, i.e. the standard transformer is the more brain-like one here.
+- **Loops still saturate at ~4** (state is a fixed point from loop 3-4 on) in all four v4 runs.
+  This is where the extra compute is wasted, and the main thing to fix.
+- Benchmarks vs baseline_150m_iso: Raslila_150m ahead on LAMBADA (24.6 vs 22.7), level on
+  ARC-e/SciQ/HellaSwag within noise; the 350M baseline is ahead on all three bits-per-byte sets.
+  var_chain swings 11-25% between runs of the same size: treat it as noise.
 
 ## Decision rules (fixed before seeing the results)
 
