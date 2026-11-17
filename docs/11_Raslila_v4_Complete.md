@@ -267,7 +267,25 @@ average that keeps fixed-8-loop quality (within 0.002). Saved to `runs/<run>/ada
   generation with a KV cache.
 - A token cannot stop after loop 1: loop 1 starts from noise, so its change is always large.
 
-Result: **pending** (run the command above).
+**Result (2026-11-17, 65,536 held-out tokens per run, no retraining).** Val losses here are
+on a different held-out sample than the training report: compare rows, not with 2.546.
+
+| raslila_150m | val loss | loops / token | GFLOPs / token |
+|---|---|---|---|
+| fixed 8 (old default) | 2.6915 | 8.00 | 1.634 |
+| fixed 4 | 2.6920 | 4.00 | 0.910 |
+| fixed 3 | 2.6939 | 3.00 | 0.728 |
+| adaptive th 0.1 | 2.6922 | 3.55 | 0.828 |
+| adaptive th 0.3 | 2.6971 | 2.59 | 0.654 |
+
+- Same quality as 8 loops at **3.55** loops/token (raslila_150m), **3.09** (lean), **3.27** (topo):
+  about **-50% inference compute** vs the 8-loop default.
+- But per-token stopping adds only ~9% over simply running 4 loops for every token: 98% of
+  tokens stop at 3 or 4 loops. The trained model thinks about equally long on easy and hard
+  tokens, so the 2.5-loop target was not reached at equal quality (2.59 loops costs +0.0056).
+- Actions: make `test_loops: 4` the default; real per-token savings need adaptive depth in
+  training (section 6, fix 2). Below th 0.01 the relative change never falls under the
+  threshold (bf16 noise floor) and tokens run to the cap.
 
 ---
 
@@ -318,7 +336,7 @@ python run.py bench --run raslila_150m --loops 1,2,4,8,16
 
 ## 12. Next steps, in priority order
 
-1. Run `adaptive` on the three 150m checkpoints (minutes): the inference-compute number.
+1. Done (adaptive measured, section 7): set test_loops to 4 by default.
 2. Third size: Raslila v4 vs baseline at ~350M, same-size and equal-compute,
    to test whether the advantage grows with scale.
 3. Adaptive training (learned per-token exit, MoR-style) to cut training compute.
